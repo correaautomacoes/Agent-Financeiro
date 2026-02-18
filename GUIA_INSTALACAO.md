@@ -72,18 +72,24 @@ Se você fez ajustes no código e quer subir as alterações para a VPS:
 
 ---
 
-## 🏗 5. Deploy Pro com Portainer + GitHub + Traefik
+## 🏗 5. Deploy Pro com Portainer + GitHub + Traefik (Swarm)
 
-Esta é a forma recomendada para manter o sistema sempre atualizado:
+Se você usa Docker Swarm com Traefik, existem dois pontos críticos que causaram o erro:
 
-1.  **Suba seu projeto**: Coloque seu código no seu GitHub.
+1.  **Rede Externa**: O Traefik precisa que a rede `traefik_public` já exista no Swarm. 
+    - Rode este comando no terminal da sua VPS antes de dar o deploy:
+      ```bash
+      docker network create --driver overlay traefik_public
+      ```
+2.  **Build no Swarm**: O comando `docker stack deploy` (usado pelo Portainer Swarm) não aceita o comando `build`. 
+    - Por isso, ajustei o `docker-stack.yaml` para usar uma imagem base do Python e baixar os requisitos na hora.
+
+### Passo a Passo no Portainer:
+1.  **Suba seu projeto**: Dê Push nas novas correções do `docker-stack.yaml` para o GitHub.
 2.  **No Portainer**:
     - Vá em **Stacks** > **Add Stack**.
     - Em **Build Method**, selecione **Repository**.
-    - Cole a URL do seu GitHub (ex: `https://github.com/seu-usuario/erp-agente`).
-    - Se o repositório for privado, configure o **Personal Access Token**.
-3.  **Configuração da Stack**:
-    - Nome: `erp-agente`.
+    - **Repository URL**: A URL do seu GitHub.
     - **Repository reference**: `refs/heads/main`
     - **Compose path**: `docker-stack.yaml`
 4.  **Variáveis de Ambiente**:
