@@ -16,16 +16,11 @@ services:
         condition: on-failure
 
   app:
-    image: python:3.11-slim
-    command: >
-      sh -c "pip install -r requirements.txt &&
-             streamlit run app.py --server.port=8501 --server.address=0.0.0.0"
-    volumes:
-      - .:/app
-    working_dir: /app
+    image: erp-agente-custom
+    build: . # O Portainer (ao usar Git) consegue buildar a imagem no nó local antes de rodar.
     networks:
       - agent_internal
-      - traefik_public # Rede onde o Traefik está rodando
+      - traefik_public
     deploy:
       labels:
         - "traefik.enable=true"
