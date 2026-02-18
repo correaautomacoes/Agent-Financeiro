@@ -84,7 +84,8 @@ Esta é a forma recomendada para manter o sistema sempre atualizado:
     - Se o repositório for privado, configure o **Personal Access Token**.
 3.  **Configuração da Stack**:
     - Nome: `erp-agente`.
-    - Compose path: `docker-stack.yaml`.
+    - **Repository reference**: `refs/heads/main`
+    - **Compose path**: `docker-stack.yaml`
 4.  **Variáveis de Ambiente**:
     - Use a área **"Environment variables"** do Portainer para adicionar a sua `GEMINI_API_KEY`, `DB_USER`, `DB_PASSWORD`, etc. (Não use o arquivo `.env` no Git por segurança).
 5.  **Deploy**: Clique em **Deploy the stack**. O Portainer vai clonar o projeto, construir a imagem e o Traefik cuidará do SSL automaticamente.

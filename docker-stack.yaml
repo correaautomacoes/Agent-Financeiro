@@ -21,7 +21,6 @@ services:
     networks:
       - agent_internal
       - traefik_public # Rede onde o Traefik está rodando
-    env_file: .env # Ou configure as Env no Portainer
     deploy:
       labels:
         - "traefik.enable=true"
