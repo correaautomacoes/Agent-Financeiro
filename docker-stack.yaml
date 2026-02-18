@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin_password
+      POSTGRES_DB: financial_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - agent_internal
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  app:
+    image: erp-agente-custom # O Portainer fará o build a partir do Git
+    build: .
+    networks:
+      - agent_internal
+      - traefik_public # Rede onde o Traefik está rodando
+    env_file: .env # Ou configure as Env no Portainer
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.erp-agente.rule=Host(`seu-dominio.com`)" # Mude para seu dominio
+        - "traefik.http.routers.erp-agente.entrypoints=websecure"
+        - "traefik.http.routers.erp-agente.tls.certresolver=letsencrypt"
+        - "traefik.http.services.erp-agente.loadbalancer.server.port=8501"
+      restart_policy:
+        condition: on-failure
+
+volumes:
+  postgres_data:
+
+networks:
+  agent_internal:
+    driver: overlay
+  traefik_public:
+    external: true

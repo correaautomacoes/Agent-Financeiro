@@ -1,0 +1,30 @@
+version: '3.8'
+
+volumes:
+  postgres-data:
+
+
+networks:
+  agent_net:
+
+
+services:
+  # Banco de Dados (PostgreSQL)
+  postgres:
+    image: postgres:15-alpine
+    container_name: financial_agent_db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin_password
+      POSTGRES_DB: financial_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - agent_net
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "admin" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
