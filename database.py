@@ -155,6 +155,7 @@ def init_db():
         reference TEXT,
         source VARCHAR(50) DEFAULT 'próprio',
         is_paid BOOLEAN DEFAULT FALSE,
+        unit_cost DECIMAL(12,2) DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -215,6 +216,7 @@ def init_db():
     try:
         run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'próprio'")
         run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS is_paid BOOLEAN DEFAULT FALSE")
+        run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS unit_cost DECIMAL(12,2) DEFAULT 0")
     except Exception as e:
         print(f"Aviso na migração: {e}")
 

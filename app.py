@@ -279,33 +279,48 @@ with tab_manual:
         if st.button("📦 Atualizar Estoque", use_container_width=True):
             target_p_id = None
             
-            if selected_p_e == "➕ Cadastrar Novo Produto":
-                if new_p_name:
-                    comps = get_companies()
-                    c_id = comps[0]['id'] if comps else create_company("Minha Empresa")
-                    target_p_id = create_product(c_id, new_p_name, new_p_price)
-                else:
-                    st.error("Digite o nome do novo produto.")
-                    st.stop()
-            elif selected_p_e != "-":
-                target_p_id = p_options_e[selected_p_e]
+            try:
+                if selected_p_e == "➕ Cadastrar Novo Produto":
+                    if new_p_name:
+                        comps = get_companies()
+                        if not comps:
+                            # Se não tem empresa, cria uma padrão na hora
+                            c_id = create_company("Minha Empresa")
+                            if not c_id:
+                                st.error("Erro fatal: Não foi possível criar uma empresa base no banco de dados.")
+                                st.stop()
+                        else:
+                            c_id = comps[0]['id']
+                        
+                        target_p_id = create_product(c_id, new_p_name, new_p_price)
+                        if not target_p_id:
+                            st.error(f"Erro ao criar o produto '{new_p_name}'. Verifique o banco de dados.")
+                            st.stop()
+                    else:
+                        st.error("Por favor, digite o nome do novo produto.")
+                        st.stop()
+                elif selected_p_e != "-":
+                    target_p_id = p_options_e[selected_p_e]
 
-            if target_p_id:
-                res = add_stock_movement(
-                    product_id=target_p_id,
-                    quantity=qty_e,
-                    movement_type=m_type,
-                    reference=ref_e,
-                    source="consignado" if consignado else "próprio",
-                    is_paid=pago,
-                    unit_cost=custo_uni
-                )
-                if res:
-                    st.success(f"Estoque {'cadastrado e ' if selected_p_e == '➕ Cadastrar Novo Produto' else ''}atualizado com sucesso!")
+                if target_p_id:
+                    res = add_stock_movement(
+                        product_id=target_p_id,
+                        quantity=qty_e,
+                        movement_type=m_type,
+                        reference=ref_e,
+                        source="consignado" if consignado else "próprio",
+                        is_paid=pago,
+                        unit_cost=custo_uni
+                    )
+                    if res:
+                        st.success(f"✅ Estoque {'cadastrado e ' if selected_p_e == '➕ Cadastrar Novo Produto' else ''}atualizado!")
+                        st.balloons() # Pequena comemoração visual
+                    else:
+                        st.error("Erro técnico ao registrar a movimentação no banco de dados.")
                 else:
-                    st.error("Erro ao atualizar estoque.")
-            else:
-                st.warning("Selecione um produto ou cadastre um novo.")
+                    st.warning("Selecione um produto ou cadastre um novo.")
+            except Exception as e:
+                st.error(f"Ocorreu um erro inesperado: {e}")
 
     with sub_tab4:
         st.subheader("Aportes e Retiradas (Sócios)")
@@ -347,15 +362,16 @@ with tab2:
     # Dados de Estoque e Receitas Detalhadas
     inv_data = get_inventory_report()
     rev_details = get_revenue_details()
-    total_inv_value = sum([item['total_value'] for item in inv_data]) if inv_data else 0
+    total_inv_cost = sum([item['total_cost_value'] for item in inv_data]) if inv_data else 0
 
     if kpi_data:
         k = kpi_data[0]
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Faturamento", f"R$ {k['revenue']:.2f}")
         c2.metric("Despesas", f"R$ {k['expenses']:.2f}", delta_color="inverse")
         c3.metric("Lucro Líquido", f"R$ {k['net_profit']:.2f}")
-        c4.metric("Valor em Estoque", f"R$ {total_inv_value:.2f}")
+        c4.metric("Valor em Estoque", f"R$ {total_inv_cost:.2f}")
+        c5.metric("💰 Saldo Total", f"R$ {k.get('total_cash', 0):.2f}")
 
     # Alertas
     alerts = get_upcoming_alerts()
@@ -396,8 +412,15 @@ with tab2:
         if inv_data:
             idf = pd.DataFrame(inv_data)
             if not idf.empty:
-                idf.columns = ['ID', 'Produto', 'Preço Unit.', 'Quantidade', 'Valor Total']
-                st.dataframe(idf[['Produto', 'Quantidade', 'Valor Total']].style.format({'Valor Total': 'R$ {:.2f}'}), use_container_width=True)
+                # Ordena colunas: id, name, price, stock_qty, last_cost, total_cost_value, total_sale_value
+                idf.columns = ['ID', 'Produto', 'Preço Venda', 'Qtd', 'Últ. Custo', 'Valor (Custo)', 'Valor (Venda)']
+                st.dataframe(
+                    idf[['Produto', 'Qtd', 'Valor (Custo)', 'Valor (Venda)']].style.format({
+                        'Valor (Custo)': 'R$ {:.2f}',
+                        'Valor (Venda)': 'R$ {:.2f}'
+                    }), 
+                    use_container_width=True
+                )
             else:
                 st.info("Nenhum produto em estoque.")
         else:

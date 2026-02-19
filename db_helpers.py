@@ -128,8 +128,8 @@ def add_stock_movement(product_id: int, quantity: int, movement_type: str, refer
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO stock_movements (product_id, quantity, movement_type, reference, source, is_paid) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-            (product_id, quantity, movement_type, reference, source, is_paid),
+            "INSERT INTO stock_movements (product_id, quantity, movement_type, reference, source, is_paid, unit_cost) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (product_id, quantity, movement_type, reference, source, is_paid, unit_cost),
         )
         mid = cur.fetchone()[0]
 
@@ -318,7 +318,8 @@ def get_advanced_kpis(period: str = 'month'):
     SELECT 
         COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE 0 END), 0) AS revenue,
         COALESCE(SUM(CASE WHEN type='Despesa' THEN amount ELSE 0 END), 0) AS expenses,
-        COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE -amount END), 0) AS net_profit
+        COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE -amount END), 0) AS net_profit,
+        (SELECT COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE -amount END), 0) FROM transactions) AS total_cash
     FROM transactions
     WHERE {filter_sql}
     """
@@ -342,14 +343,16 @@ def create_fixed_expense(company_id: int, name: str, amount: float, due_day: int
     return run_query(query, (company_id, name, amount, due_day))
 
 def get_inventory_report():
-    """Retorna o resumo do estoque, quantidades e valor total por produto."""
+    """Retorna o resumo do estoque, quantidades e valor total baseado no custo e no preço de venda."""
     query = """
     SELECT 
         p.id, 
         p.name, 
         p.price,
         COALESCE(SUM(CASE WHEN m.movement_type='in' THEN m.quantity WHEN m.movement_type='out' THEN -m.quantity END), 0) as stock_qty,
-        (p.price * COALESCE(SUM(CASE WHEN m.movement_type='in' THEN m.quantity WHEN m.movement_type='out' THEN -m.quantity END), 0)) as total_value
+        COALESCE(MAX(m.unit_cost), 0) as last_cost,
+        (COALESCE(MAX(m.unit_cost), 0) * COALESCE(SUM(CASE WHEN m.movement_type='in' THEN m.quantity WHEN m.movement_type='out' THEN -m.quantity END), 0)) as total_cost_value,
+        (p.price * COALESCE(SUM(CASE WHEN m.movement_type='in' THEN m.quantity WHEN m.movement_type='out' THEN -m.quantity END), 0)) as total_sale_value
     FROM products p
     LEFT JOIN stock_movements m ON p.id = m.product_id
     GROUP BY p.id, p.name, p.price
