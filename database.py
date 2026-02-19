@@ -153,6 +153,8 @@ def init_db():
         quantity INTEGER NOT NULL,
         movement_type VARCHAR(10) NOT NULL CHECK (movement_type IN ('in','out')),
         reference TEXT,
+        source VARCHAR(50) DEFAULT 'próprio',
+        is_paid BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -208,10 +210,18 @@ def init_db():
 
     # Executa a criação das tabelas
     res = run_query(create_table_query)
+    
+    # MIGRATIONS: Adiciona colunas se não existirem (para quem já tem o DB rodando)
+    try:
+        run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'próprio'")
+        run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS is_paid BOOLEAN DEFAULT FALSE")
+    except Exception as e:
+        print(f"Aviso na migração: {e}")
+
     if res is None:
-        print("Houve um erro ao criar as tabelas. Veja logs acima.")
+        print("Houve um erro ao criar/atualizar as tabelas.")
     else:
-        print("Migrações iniciais aplicadas com sucesso — tabelas verificadas/criadas.")
+        print("Banco de dados inicializado/atualizado com sucesso!")
 
 
 if __name__ == "__main__":
