@@ -18,21 +18,35 @@ Antes de rodar os instaladores, certifique-se de ter os seguintes softwares em s
 
 ---
 
-## 🚀 2. Instalação "Um-Clique" (Recomendado)
-
-Desenvolvemos scripts que automatizam todo o processo de configuração:
+## 🚀 2. Instalação Passo a Passo
 
 ### No Windows:
 1.  Localize o arquivo **`instalar_windows.bat`** na pasta do projeto.
 2.  Dê um duplo-clique nele.
 3.  O script vai criar o ambiente, instalar as bibliotecas e **pedir a sua API Key do Gemini**. Basta colar e dar Enter.
-4.  O sistema abrirá automaticamente no final!
 
-### Na VPS (Linux/Ubuntu):
-1.  Mande a pasta do projeto para sua VPS.
-2.  No terminal, dê permissão ao instalador: `chmod +x instalar_vps.sh`
-3.  Rode o script: `./instalar_vps.sh`
-4.  Siga as instruções na tela para configurar sua API Key.
+### Na VPS (Via Terminal/Git):
+Se você quer subir o projeto direto no terminal da sua VPS Linux:
+
+1.  **Acesse sua VPS** via SSH.
+2.  **Instale o Git (se não tiver):**
+    ```bash
+    sudo apt update && sudo apt install git -y
+    ```
+3.  **Clone o Projeto:**
+    ```bash
+    git clone https://github.com/correaautomacoes/Agent-Financeiro.git
+    cd Agent-Financeiro
+    ```
+4.  **Dê permissão aos scripts:**
+    ```bash
+    chmod +x *.sh
+    ```
+5.  **Execute o Instalador:**
+    ```bash
+    ./instalar_vps.sh
+    ```
+    *O script vai pedir sua GEMINI_API_KEY e subir o Banco + App automaticamente.*
 
 ---
 
