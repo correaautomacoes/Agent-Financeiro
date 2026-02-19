@@ -95,6 +95,8 @@ def process_chat_command(user_input, context_data=None, suggested_intent=None, e
         5. `PARTNER_WITHDRAWAL`: Retirada/Saque de lucros de um sócio.
         6. `CREATE_PRODUCT`: Cadastrar um novo produto (nome, preço e QUANTIDADE inicial se houver).
 
+        INSTRUÇÃO ESPECIAL: Se o usuário falar sobre 'Entrada' ou 'Saída', use a intenção `STOCK_MOVEMENT`.
+
         REGRAS DE RESPOSTA:
         - Retorne APENAS um JSON.
         - Se a informação estiver incompleta (ex: falta o preço ou a quantidade inicial em CREATE_PRODUCT), preencha o campo "status" como "INCOMPLETE".

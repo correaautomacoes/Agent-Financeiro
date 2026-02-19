@@ -34,16 +34,19 @@ with tab1:
     
     with col_info:
         st.subheader("🛠️ O que deseja fazer?")
-        intent_options = {
-            "💰 Lançar Receita/Despesa": "SAVE_TRANSACTION",
-            "🛒 Registrar Venda": "REGISTER_SALE",
-            "📦 Movimentação de Estoque": "STOCK_MOVEMENT",
-            "🤝 Lançamento de Sócio": "PARTNER_CONTRIBUTION",
-            "💸 Retirada de Sócio": "PARTNER_WITHDRAWAL",
-            "📝 Criar Produto": "CREATE_PRODUCT"
+        intent_option = st.radio("Escolha uma ação para guiar a IA:", 
+                                ["Lançar Receita/Despesa", "Registrar Venda", "Entrada/Saída de Estoque", "Lançamento de Sócio", "Retirada de Sócio", "Criar Produto"])
+        
+        intent_map = {
+            "Lançar Receita/Despesa": "SAVE_TRANSACTION",
+            "Registrar Venda": "REGISTER_SALE",
+            "Entrada/Saída de Estoque": "STOCK_MOVEMENT",
+            "Lançamento de Sócio": "PARTNER_CONTRIBUTION",
+            "Retirada de Sócio": "PARTNER_WITHDRAWAL",
+            "Criar Produto": "CREATE_PRODUCT"
         }
-        selected_label = st.radio("Escolha uma ação para guiar a IA:", options=list(intent_options.keys()))
-        selected_intent = intent_options[selected_label]
+        selected_label = intent_option
+        selected_intent = intent_map[selected_label]
         
         # Dicas dinâmicas
         hints = {
@@ -111,20 +114,36 @@ with tab1:
             if st.button("✅ Confirmar e Salvar"):
                 success = False
                 try:
+                    # Se for STOCK_MOVEMENT ou REGISTER_SALE e o product_id estiver nulo, cria o produto antes
+                    p_id = data.get("product_id")
+                    if not p_id and intent in ["STOCK_MOVEMENT", "REGISTER_SALE"]:
+                        comps = get_companies()
+                        comp_id = comps[0]['id'] if comps else create_company("Minha Empresa")
+                        p_id = create_product(
+                            company_id=comp_id,
+                            name=data.get("description", "Produto Novo"),
+                            price=data.get("amount", 0.0) / data.get("quantity", 1) if data.get("quantity", 1) > 0 else data.get("amount", 0.0)
+                        )
+                        data["product_id"] = p_id
+
                     if intent == "SAVE_TRANSACTION":
                         q = "INSERT INTO transactions (type, amount, category, description, date) VALUES (%s,%s,%s,%s,%s)"
                         params = (data.get("type"), data.get("amount"), data.get("category"), data.get("description"), data.get("date"))
                         success = run_query(q, params)
                     
                     elif intent == "REGISTER_SALE":
-                        # Usa o helper de venda que já baixa estoque
-                        res = create_sale(
-                            product_id=data.get("product_id"),
-                            quantity=data.get("quantity", 1),
-                            unit_price=data.get("amount", 0) / data.get("quantity", 1),
-                            description=data.get("description")
-                        )
-                        success = res is not None
+                        if p_id:
+                            # Usa o helper de venda que já baixa estoque
+                            res = create_sale(
+                                product_id=p_id,
+                                quantity=data.get("quantity", 1),
+                                unit_price=data.get("amount", 0) / data.get("quantity", 1) if data.get("quantity", 1) > 0 else 0,
+                                description=data.get("description")
+                            )
+                            success = res is not None
+                        else:
+                            st.error("Produto não identificado. Tente dizer o nome correto do produto ou crie-o primeiro.")
+                            success = False
                     
                     elif intent == "PARTNER_CONTRIBUTION":
                         res = create_contribution(data.get("partner_id"), data.get("amount"), data.get("date"), data.get("description"))
@@ -157,14 +176,13 @@ with tab1:
                         success = p_id is not None
 
                     elif intent == "STOCK_MOVEMENT":
-                        # Identifica tipo de movimento da IA ou assume 'in' se for compra/chegada
-                        m_type = data.get("type", "in")
-                        qty = int(data.get("quantity", 1))
-                        p_id = data.get("product_id")
-                        
                         if p_id:
+                            # Identifica tipo de movimento da IA ou assume 'in' se for compra/chegada
+                            m_type = data.get("type", "in")
+                            qty = int(data.get("quantity", 1))
+                            
                             res = add_stock_movement(
-                                product_id=int(p_id),
+                                product_id=p_id,
                                 quantity=qty,
                                 movement_type=m_type,
                                 reference=data.get("description"),
