@@ -25,8 +25,8 @@ st.set_page_config(page_title="Agente Financeiro", page_icon="💰", layout="wid
 
 st.title("💰 Agente Financeiro Inteligente")
 
-# Abas para separar Chat, Dashboard e Importação
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["💬 Chat", "📊 Dashboard", "📂 Importar", "⚙️ Gerenciar", "📤 Exportar"])
+# Abas para separar Chat, Lançamentos, Dashboard e Importação
+tab1, tab_manual, tab2, tab3, tab4, tab5 = st.tabs(["💬 Chat", "📝 Lançamentos", "📊 Dashboard", "📂 Importar", "⚙️ Gerenciar", "📤 Exportar"])
 
 # --- TAB 1: CHAT ---
 with tab1:
@@ -205,6 +205,107 @@ with tab1:
             if st.button("❌ Cancelar"):
                 st.session_state.current_action = None
                 st.rerun()
+
+# --- TAB: LANÇAMENTOS (MANUAL) ---
+with tab_manual:
+    st.header("📝 Lançamentos Manuais")
+    st.info("Utilize os formulários abaixo para registros rápidos sem o uso do chat.")
+    
+    sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs(["🛒 Venda", "💰 Financeiro", "📦 Estoque", "👥 Sócios"])
+    
+    with sub_tab1:
+        st.subheader("Registrar Venda")
+        prods = get_products()
+        p_options = {f"{p['name']} (R$ {p['price']})": p['id'] for p in prods}
+        selected_p = st.selectbox("Selecione o Produto", options=["-"] + list(p_options.keys()))
+        qty_venda = st.number_input("Quantidade", min_value=1, value=1)
+        desc_venda = st.text_input("Observação (opcional)", placeholder="Ex: Venda balcão")
+        
+        if st.button("🚀 Registrar Venda", use_container_width=True):
+            if selected_p != "-":
+                p_id = p_options[selected_p]
+                # Pega o preço unitário do nome ou do banco
+                p_obj = next(p for p in prods if p['id'] == p_id)
+                res = create_sale(p_id, qty_venda, p_obj['price'], desc_venda)
+                if res:
+                    st.success("Venda registrada e estoque atualizado!")
+                else:
+                    st.error("Erro ao registrar venda. Verifique o estoque.")
+            else:
+                st.warning("Selecione um produto.")
+
+    with sub_tab2:
+        st.subheader("Nova Receita ou Despesa")
+        tipo_f = st.radio("Tipo", ["Receita", "Despesa"], horizontal=True)
+        valor_f = st.number_input("Valor (R$)", min_value=0.01, step=0.01)
+        cat_f = st.text_input("Categoria", placeholder="Ex: Aluguel, Marketing, Venda direta")
+        desc_f = st.text_area("Descrição", placeholder="Detalhes do lançamento...")
+        data_f = st.date_input("Data", value=date.today())
+        
+        if st.button("➕ Salvar no Financeiro", use_container_width=True):
+            q = "INSERT INTO transactions (type, amount, category, description, date) VALUES (%s,%s,%s,%s,%s)"
+            params = (tipo_f, valor_f, cat_f, desc_f, data_f)
+            if run_query(q, params):
+                st.success(f"{tipo_f} lançada com sucesso!")
+            else:
+                st.error("Erro ao salvar lançamento.")
+
+    with sub_tab3:
+        st.subheader("Entrada ou Saída de Peças")
+        prods_e = get_products()
+        p_options_e = {p['name']: p['id'] for p in prods_e}
+        selected_p_e = st.selectbox("Produto", options=["-"] + list(p_options_e.keys()), key="stock_p")
+        tipo_e = st.selectbox("Movimento", ["Entrada (Compra/Ajuste)", "Saída (Perda/Ajuste)"])
+        qty_e = st.number_input("Quantidade de Itens", min_value=1, value=1, key="stock_qty")
+        m_type = "in" if "Entrada" in tipo_e else "out"
+        
+        consignado = st.checkbox("Produto Consignado?")
+        pago = st.checkbox("Já foi pago?")
+        custo_uni = st.number_input("Custo Unitário (se pago)", min_value=0.0, step=0.01) if pago else 0.0
+        ref_e = st.text_input("Referência/Motivo", placeholder="Ex: Compra fornecedor X")
+
+        if st.button("📦 Atualizar Estoque", use_container_width=True):
+            if selected_p_e != "-":
+                res = add_stock_movement(
+                    product_id=p_options_e[selected_p_e],
+                    quantity=qty_e,
+                    movement_type=m_type,
+                    reference=ref_e,
+                    source="consignado" if consignado else "próprio",
+                    is_paid=pago,
+                    unit_cost=custo_uni
+                )
+                if res:
+                    st.success("Estoque atualizado com sucesso!")
+                else:
+                    st.error("Erro ao atualizar estoque.")
+            else:
+                st.warning("Selecione um produto.")
+
+    with sub_tab4:
+        st.subheader("Aportes e Retiradas (Sócios)")
+        partners = get_partners()
+        if partners:
+            p_options_s = {p['name']: p['id'] for p in partners}
+            selected_p_s = st.selectbox("Sócio", options=list(p_options_s.keys()))
+            tipo_s = st.radio("Ação", ["Aporte (Investimento)", "Retirada (Saque de Lucro)"], horizontal=True)
+            valor_s = st.number_input("Valor R$", min_value=0.01, step=0.01, key="partner_val")
+            data_s = st.date_input("Data do Evento", value=date.today(), key="partner_date")
+            desc_s = st.text_input("Nota/Motivo", key="partner_note")
+
+            if st.button("💎 Confirmar Lançamento de Sócio", use_container_width=True):
+                p_id = p_options_s[selected_p_s]
+                if "Aporte" in tipo_s:
+                    res = create_contribution(p_id, valor_s, data_s, desc_s)
+                else:
+                    res = create_withdrawal(p_id, valor_s, data_s, desc_s)
+                
+                if res:
+                    st.success("Lançamento de sócio registrado!")
+                else:
+                    st.error("Erro ao registrar. Verifique o saldo disponível.")
+        else:
+            st.warning("Nenhum sócio cadastrado. Vá em 'Gerenciar' primeiro.")
 
 # --- TAB 2: DASHBOARD ---
 with tab2:
