@@ -254,7 +254,19 @@ with tab_manual:
         st.subheader("Entrada ou Saída de Peças")
         prods_e = get_products()
         p_options_e = {p['name']: p['id'] for p in prods_e}
-        selected_p_e = st.selectbox("Produto", options=["-"] + list(p_options_e.keys()), key="stock_p")
+        
+        # Adiciona opção de cadastrar novo
+        selected_p_e = st.selectbox("Produto", options=["-", "➕ Cadastrar Novo Produto"] + list(p_options_e.keys()), key="stock_p")
+        
+        new_p_name = ""
+        new_p_price = 0.0
+        
+        if selected_p_e == "➕ Cadastrar Novo Produto":
+            col_n1, col_n2 = st.columns(2)
+            new_p_name = col_n1.text_input("Nome do Novo Produto", placeholder="Ex: Notebook i5 Dell")
+            new_p_price = col_n2.number_input("Preço de Venda Sugerido (R$)", min_value=0.0, step=0.01)
+            st.divider()
+
         tipo_e = st.selectbox("Movimento", ["Entrada (Compra/Ajuste)", "Saída (Perda/Ajuste)"])
         qty_e = st.number_input("Quantidade de Itens", min_value=1, value=1, key="stock_qty")
         m_type = "in" if "Entrada" in tipo_e else "out"
@@ -265,9 +277,22 @@ with tab_manual:
         ref_e = st.text_input("Referência/Motivo", placeholder="Ex: Compra fornecedor X")
 
         if st.button("📦 Atualizar Estoque", use_container_width=True):
-            if selected_p_e != "-":
+            target_p_id = None
+            
+            if selected_p_e == "➕ Cadastrar Novo Produto":
+                if new_p_name:
+                    comps = get_companies()
+                    c_id = comps[0]['id'] if comps else create_company("Minha Empresa")
+                    target_p_id = create_product(c_id, new_p_name, new_p_price)
+                else:
+                    st.error("Digite o nome do novo produto.")
+                    st.stop()
+            elif selected_p_e != "-":
+                target_p_id = p_options_e[selected_p_e]
+
+            if target_p_id:
                 res = add_stock_movement(
-                    product_id=p_options_e[selected_p_e],
+                    product_id=target_p_id,
                     quantity=qty_e,
                     movement_type=m_type,
                     reference=ref_e,
@@ -276,11 +301,11 @@ with tab_manual:
                     unit_cost=custo_uni
                 )
                 if res:
-                    st.success("Estoque atualizado com sucesso!")
+                    st.success(f"Estoque {'cadastrado e ' if selected_p_e == '➕ Cadastrar Novo Produto' else ''}atualizado com sucesso!")
                 else:
                     st.error("Erro ao atualizar estoque.")
             else:
-                st.warning("Selecione um produto.")
+                st.warning("Selecione um produto ou cadastre um novo.")
 
     with sub_tab4:
         st.subheader("Aportes e Retiradas (Sócios)")
