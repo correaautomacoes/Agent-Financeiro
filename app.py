@@ -4,7 +4,7 @@ from datetime import date
 import plotly.express as px
 import io
 from database import run_query, save_transactions_batch
-from ai_agent import process_chat_command, generate_ai_reply, process_statement
+from ai_agent import process_chat_command, generate_ai_reply, process_statement, set_api_key_permanent
 from db_helpers import (
     create_company, get_companies,
     create_partner, get_partners,
@@ -418,9 +418,8 @@ with tab4:
         new_key = st.text_input("Gemini API Key", value=current_key, type="password", help="Obtenha sua chave em aistudio.google.com")
         
         if st.button("💾 Salvar Configurações"):
-            st.session_state.api_key = new_key
-            st.success("Configurações salvas com sucesso! A IA agora usará a nova chave.")
-            st.info("Nota: Esta chave ficará ativa apenas durante esta sessão. Para torná-la permanente, altere o arquivo .env.")
+            set_api_key_permanent(new_key)
+            st.success("Configurações salvas permanentemente no arquivo .env! A IA agora usará a nova chave.")
 
     st.divider()
     st.subheader("Produtos e Estoque")

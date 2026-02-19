@@ -27,6 +27,31 @@ def get_api_key():
         return st.session_state.api_key
     return os.getenv("GEMINI_API_KEY")
 
+def set_api_key_permanent(new_key):
+    """Grava a nova chave permanentemente no arquivo .env"""
+    env_path = ".env"
+    if not os.path.exists(env_path):
+        with open(env_path, "w") as f:
+            f.write(f"GEMINI_API_KEY={new_key}\n")
+    else:
+        with open(env_path, "r") as f:
+            lines = f.readlines()
+        
+        with open(env_path, "w") as f:
+            found = False
+            for line in lines:
+                if line.startswith("GEMINI_API_KEY="):
+                    f.write(f"GEMINI_API_KEY={new_key}\n")
+                    found = True
+                else:
+                    f.write(line)
+            if not found:
+                f.write(f"GEMINI_API_KEY={new_key}\n")
+    
+    # Atualiza o ambiente do processo atual também
+    os.environ["GEMINI_API_KEY"] = new_key
+    st.session_state.api_key = new_key
+
 API_KEY = get_api_key()
 
 def configure_genai():
