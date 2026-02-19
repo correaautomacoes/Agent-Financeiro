@@ -72,17 +72,19 @@ Se você é o dono do projeto e quer enviar para alguém, siga este checklist pa
 
 ---
 
-## 🔄 4. Como atualizar o sistema na VPS?
+## 🔄 3. Como atualizar o sistema na VPS?
 
-Se você fez ajustes no código e quer subir as alterações para a VPS:
+Sempre que você fizer uma alteração no código no seu PC e quiser enviar para a VPS, siga estes passos:
 
-1.  Envie os novos arquivos para a pasta do projeto na VPS (substituindo os antigos).
-2.  No terminal da VPS, rode o script de atualização:
+1.  **No seu PC**: Faça o `Commit` e o `Push` para o GitHub.
+2.  **Na VPS**: Acesse o terminal e rode:
     ```bash
+    cd Agent-Financeiro
+    git pull
     chmod +x atualizar_vps.sh
     ./atualizar_vps.sh
     ```
-    *Dica: Esse comando reconstrói apenas a parte do código, sem apagar os seus dados salvos no banco de dados.*
+    *Dica: O `git pull` baixa os arquivos novos e o `./atualizar_vps.sh` reconstrói o sistema no Docker para aplicar as mudanças.*
 
 ---
 
