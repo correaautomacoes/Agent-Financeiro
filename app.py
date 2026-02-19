@@ -409,6 +409,19 @@ with tab4:
         st.write("Sócios:")
         st.dataframe(pd.DataFrame(partners), use_container_width=True)
 
+    # --- CONFIGURAÇÕES DO SISTEMA ---
+    with st.expander("⚙️ Configurações do Sistema", expanded=False):
+        st.subheader("Configuração da IA (Gemini)")
+        # Tenta pegar a chave do .env se não houver no session_state
+        current_key = st.session_state.get("api_key", os.getenv("GEMINI_API_KEY", ""))
+        
+        new_key = st.text_input("Gemini API Key", value=current_key, type="password", help="Obtenha sua chave em aistudio.google.com")
+        
+        if st.button("💾 Salvar Configurações"):
+            st.session_state.api_key = new_key
+            st.success("Configurações salvas com sucesso! A IA agora usará a nova chave.")
+            st.info("Nota: Esta chave ficará ativa apenas durante esta sessão. Para torná-la permanente, altere o arquivo .env.")
+
     st.divider()
     st.subheader("Produtos e Estoque")
     prod_comp = st.selectbox("Empresa para produto", options=["-"] + list(companies_select.keys()), key="prod_company")

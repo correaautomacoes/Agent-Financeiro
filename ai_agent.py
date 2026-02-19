@@ -17,14 +17,26 @@ def sanitize_data(data):
         return data.isoformat()
     return data
 
+import streamlit as st
+
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY")
+# Prioriza a chave vinda da interface (session_state), depois .env
+def get_api_key():
+    if "api_key" in st.session_state and st.session_state.api_key:
+        return st.session_state.api_key
+    return os.getenv("GEMINI_API_KEY")
 
-if API_KEY:
-    genai.configure(api_key=API_KEY)
-else:
-    print("Aviso: GEMINI_API_KEY não encontrada no .env")
+API_KEY = get_api_key()
+
+def configure_genai():
+    key = get_api_key()
+    if key:
+        genai.configure(api_key=key)
+        return True
+    return False
+
+configure_genai()
 
 # Tentando usar o modelo mais leve "latest"
 MODEL_NAME = "gemini-flash-latest"
@@ -34,8 +46,8 @@ def process_chat_command(user_input, context_data=None, suggested_intent=None, e
     Usa o Gemini para detectar intenções ERP e extrair dados.
     Suporta: Receita, Despesa, Venda, Estoque (In/Out), Aporte, Retirada.
     """
-    if not API_KEY:
-        return {"error": "API Key não configurada"}
+    if not configure_genai():
+        return {"error": "API Key não configurada. Vá em 'Gerenciar' e configure sua chave."}
 
     try:
         model = genai.GenerativeModel(MODEL_NAME)
@@ -121,8 +133,8 @@ def process_statement(file_content):
     """
     Processa o conteúdo bruto de um arquivo (CSV/TXT) e retorna uma lista de transações estruturadas.
     """
-    if not API_KEY:
-        return {"error": "API Key não configurada"}
+    if not configure_genai():
+        return {"error": "API Key não configurada. Vá em 'Gerenciar' e configure sua chave."}
 
     try:
         model = genai.GenerativeModel(MODEL_NAME)
