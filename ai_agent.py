@@ -156,44 +156,50 @@ def generate_ai_reply(ai_response):
     
     return msg + "\nPosso confirmar o lançamento?"
 
-def process_statement(file_content):
+def process_statement(file_content, entities_context=None):
     """
-    Processa o conteúdo bruto de um arquivo (CSV/TXT) e retorna uma lista de transações estruturadas.
+    Processa o conteúdo bruto de um arquivo (CSV/TXT/Excel convertido) e retorna uma lista 
+    de ações ERP estruturadas (Vendas, Estoque, Financeiro).
     """
     if not configure_genai():
-        return {"error": "API Key não configurada. Vá em 'Gerenciar' e configure sua chave."}
+        return {"error": "API Key não configurada."}
 
     try:
         model = genai.GenerativeModel(MODEL_NAME)
-        
         today = date.today().isoformat()
-        
+        entities_str = f"\nEntidades Existentes: {json.dumps(sanitize_data(entities_context))}" if entities_context else ""
+
         prompt = f"""
-        Você é um analista financeiro especialista em conversão de dados.
-        Hoje é: {today}
+        Você é um analista de dados especialista em ERP. Sua missão é ler o conteúdo de uma planilha e extrair TODAS as movimentações.
+        Hoje é: {today} {entities_str}
         
-        TAREFA: Analise o seguinte extrato bancário (CSV ou Texto) e extraia TODAS as transações e as categorize.
+        REGRAS DE IDENTIFICAÇÃO:
+        1. Se a linha contiver palavras como "venda", "cupom", "cliente", "pedido" -> Intenção: `REGISTER_SALE`
+        2. Se a linha contiver "entrada", "compra", "fornecedor", "chegada de mercadoria" -> Intenção: `STOCK_MOVEMENT` (type='in')
+        3. Se for pagamento de conta, aluguel, recebimento genérico, luz, telefone -> Intenção: `SAVE_TRANSACTION`
+        4. Se for aporte ou retirada de sócio -> `PARTNER_CONTRIBUTION` ou `PARTNER_WITHDRAWAL`.
         
-        REGRAS:
-        1. Ignore linhas de cabeçalho, saldo ou lixo.
-        2. Identifique: Data, Descrição, Valor.
-        3. Determine se é "Receita" (crédito/positivo) ou "Despesa" (débito/negativo).
-        4. Converta o valor para float positivo sempre (o campo 'type' define o sinal).
-        5. Sugira uma 'category' para cada item.
+        MAPEAMENTO DE PRODUTOS:
+        - Se identificar um nome de produto, procure nas 'Entidades Existentes'. Se achar, use o 'product_id'.
         
-        DADOS DO ARQUIVO:
+        DADOS DA PLANILHA:
         ---
-        {file_content[:10000]}  # Limitando tamanho por precaução
+        {file_content[:15000]}
         ---
         
-        SAÍDA (JSON Puro, Lista de Objetos):
+        SAÍDA (JSON Puro - Lista de Intenções):
         [
             {{
-                "date": "YYYY-MM-DD",
-                "description": "Nome do estabelecimento",
-                "amount": 100.50,
-                "type": "Despesa",
-                "category": "Alimentação"
+                "intent": "NOME_DA_INTENCAO",
+                "data": {{
+                    "date": "YYYY-MM-DD",
+                    "amount": float,
+                    "description": "Descrição original",
+                    "quantity": int (se aplicável),
+                    "product_id": int (se identificado),
+                    "type": "Receita" | "Despesa" | "in" | "out",
+                    "category": "Categoria sugerida"
+                }}
             }},
             ...
         ]
@@ -202,7 +208,15 @@ def process_statement(file_content):
         response = model.generate_content(prompt)
         text_response = response.text.replace('```json', '').replace('```', '').strip()
         
+        # Tenta sanitizar se o JSON vier quebrado
+        if not text_response.startswith('['):
+            # Procura o primeiro [ e o último ]
+            start = text_response.find('[')
+            end = text_response.rfind(']') + 1
+            if start != -1 and end != 0:
+                text_response = text_response[start:end]
+
         return json.loads(text_response)
     
     except Exception as e:
-        return {"error": f"Erro processando arquivo: {str(e)}"}
+        return {"error": f"Erro processando dados: {str(e)}"}

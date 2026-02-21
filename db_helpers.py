@@ -295,3 +295,21 @@ def get_income_types(company_id=None):
     if company_id:
         q += f" WHERE company_id = {company_id}"
     return run_query(q) or []
+
+def delete_transaction(transaction_id: int) -> bool:
+    """Deleta um lançamento financeiro pelo ID."""
+    res = run_query("DELETE FROM transactions WHERE id = %s", (transaction_id,))
+    return res is True
+
+def get_all_transactions(limit: int = 200) -> List[Dict[str, Any]]:
+    """Busca o histórico unificado (financeiro e estoque)."""
+    # Busca transações financeiras e movimentos de estoque
+    query = f"""
+    SELECT id, date, type, amount, category, description FROM transactions
+    UNION ALL
+    SELECT m.id, date(m.created_at) as date, 'Estoque' as type, (m.unit_cost * m.quantity) as amount, m.movement_type as category, p.name || ' (' || m.reference || ')' as description 
+    FROM stock_movements m
+    JOIN products p ON m.product_id = p.id
+    ORDER BY date DESC, id DESC LIMIT {limit}
+    """
+    return run_query(query) or []

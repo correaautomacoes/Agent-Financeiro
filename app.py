@@ -13,7 +13,8 @@ from db_helpers import (
     get_expense_types, get_income_types,
     create_sale, create_contribution, create_withdrawal,
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
-    create_fixed_expense, get_inventory_report, get_revenue_details
+    create_fixed_expense, get_inventory_report, get_revenue_details,
+    delete_transaction, get_all_transactions
 )
 from backup_utils import export_backup, import_backup
 import os
@@ -26,8 +27,8 @@ st.set_page_config(page_title="Agente Financeiro", page_icon="💰", layout="wid
 
 st.title("💰 Agente Financeiro Inteligente")
 
-# Abas para separar Chat, Lançamentos, Dashboard e Importação
-tab1, tab_manual, tab2, tab3, tab4, tab5 = st.tabs(["💬 Chat", "📝 Lançamentos", "📊 Dashboard", "📂 Importar", "⚙️ Gerenciar", "📤 Exportar"])
+# Abas para separar Chat, Lançamentos, Dashboard, Histórico, Importação e Gerenciamento
+tab1, tab_manual, tab2, tab_history, tab3, tab4, tab5 = st.tabs(["💬 Chat", "📝 Lançamentos", "📊 Dashboard", "📜 Histórico", "📂 Importar", "⚙️ Gerenciar", "📤 Exportar"])
 
 # --- TAB 1: CHAT ---
 with tab1:
@@ -272,9 +273,13 @@ with tab_manual:
         qty_e = st.number_input("Quantidade de Itens", min_value=1, value=1, key="stock_qty")
         m_type = "in" if "Entrada" in tipo_e else "out"
         
-        consignado = st.checkbox("Produto Consignado?")
-        pago = st.checkbox("Já foi pago?")
-        custo_uni = st.number_input("Custo Unitário (se pago)", min_value=0.0, step=0.01) if pago else 0.0
+        col_st1, col_st2 = st.columns(2)
+        with col_st1:
+            consignado = st.checkbox("Produto Consignado?")
+            pago = st.checkbox("Já foi pago?")
+        with col_st2:
+            custo_uni = st.number_input("Custo Unitário / Valor de Acerto (R$)", min_value=0.0, step=0.01, help="Mesmo se for consignado, coloque o valor que você deve pagar ao fornecedor.")
+            
         ref_e = st.text_input("Referência/Motivo", placeholder="Ex: Compra fornecedor X")
 
         if st.button("📦 Atualizar Estoque", use_container_width=True):
@@ -363,16 +368,24 @@ with tab2:
     # Dados de Estoque e Receitas Detalhadas
     inv_data = get_inventory_report()
     rev_details = get_revenue_details()
-    total_inv_cost = sum([item['total_cost_value'] for item in inv_data]) if inv_data else 0
+    # Mostramos o valor de VENDA total no dashboard (é o potencial de receita parada)
+    total_inv_sale = sum([item.get('total_sale_value', 0) for item in inv_data]) if inv_data else 0
 
+    # KPIs Principais
+    c1, c2, c3, c4, c5 = st.columns(5)
     if kpi_data:
         k = kpi_data[0]
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Faturamento", f"R$ {k['revenue']:.2f}")
-        c2.metric("Despesas", f"R$ {k['expenses']:.2f}", delta_color="inverse")
-        c3.metric("Lucro Líquido", f"R$ {k['net_profit']:.2f}")
-        c4.metric("Valor em Estoque", f"R$ {total_inv_cost:.2f}")
+        c1.metric("Faturamento", f"R$ {k.get('revenue', 0):.2f}")
+        c2.metric("Despesas", f"R$ {k.get('expenses', 0):.2f}", delta_color="inverse")
+        c3.metric("Lucro Líquido", f"R$ {k.get('net_profit', 0):.2f}")
+        c4.metric("Valor em Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
         c5.metric("💰 Saldo Total", f"R$ {k.get('total_cash', 0):.2f}")
+    else:
+        c1.metric("Faturamento", "R$ 0.00")
+        c2.metric("Despesas", "R$ 0.00")
+        c3.metric("Lucro Líquido", "R$ 0.00")
+        c4.metric("Valor em Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
+        c5.metric("💰 Saldo Total", "R$ 0.00")
 
     # Alertas
     alerts = get_upcoming_alerts()
@@ -461,72 +474,194 @@ with tab2:
             st.subheader("Faturamento Mensal")
             st.plotly_chart(px.bar(df, x='date', y='amount', color='type', barmode='group'), use_container_width=True)
 
+# --- TAB: HISTÓRICO ---
+with tab_history:
+    st.header("📜 Histórico de Lançamentos")
+    st.markdown("Veja tudo o que foi lançado e cancele registros se necessário.")
+
+    # Filtros
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        # Padrão: primeiro dia do mês atual para garantir que os lançamentos recentes apareçam
+        date_filter = st.date_input("Filtrar por data inicial", value=date.today().replace(day=1))
+    with col_f2:
+        type_filter = st.selectbox("Filtrar por tipo", ["Todos", "Receita", "Despesa"])
+    
+    # Busca dados
+    all_trans = get_all_transactions(limit=300)
+    if all_trans:
+        df_h = pd.DataFrame(all_trans)
+        df_h['date'] = pd.to_datetime(df_h['date']).dt.date
+        
+        # Aplicar filtros
+        filtered_df = df_h[df_h['date'] >= date_filter]
+        if type_filter != "Todos":
+            filtered_df = filtered_df[filtered_df['type'] == type_filter]
+        
+        if not filtered_df.empty:
+            # Seleção para deletar
+            st.divider()
+            st.subheader("🗑️ Cancelar um Lançamento")
+            options = ["Selecione um item..."] + [f"ID: {row['id']} | {row['date']} | {row['type']} | R$ {row['amount']:.2f} | {row['description']}" for _, row in filtered_df.iterrows()]
+            to_delete = st.selectbox("Escolha o lançamento para cancelar:", options)
+            
+            if to_delete != "Selecione um item...":
+                t_id = int(to_delete.split("|")[0].replace("ID: ", "").strip())
+                if st.button("❌ Confirmar Exclusão Definitiva", type="primary"):
+                    if delete_transaction(t_id):
+                        st.success("Lançamento cancelado com sucesso!")
+                        st.rerun()
+                    else:
+                        st.error("Erro ao excluir lançamento.")
+
+            st.divider()
+            st.subheader("📋 Lista Completa")
+            # Exibir tabela formatada
+            display_h = filtered_df[['id', 'date', 'type', 'amount', 'category', 'description']].copy()
+            display_h.columns = ['ID', 'Data', 'Tipo', 'Valor', 'Categoria', 'Descrição']
+            st.dataframe(display_h.style.format({'Valor': 'R$ {:.2f}'}), use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhum lançamento encontrado para os filtros selecionados.")
+    else:
+        st.info("Ainda não há lançamentos registrados.")
+
 # --- TAB 3: IMPORTAR ---
 with tab3:
-    st.header("Importação de Extratos")
-    st.markdown("Faça upload de **CSV, TXT ou copie o texto** do seu extrato para identificar transações automaticamente.")
+    st.header("Importação Inteligente de Planilhas")
+    st.markdown("Faça upload de **Excel (.xlsx), CSV ou Texto** para identificar transações automaticamente.")
 
-    uploaded_file = st.file_uploader("Escolha um arquivo", type=["csv", "txt"])
+    uploaded_file = st.file_uploader("Escolha um arquivo", type=["csv", "txt", "xlsx"])
     text_input = st.text_area("Ou cole o texto do extrato aqui:")
 
-    if st.button("🚀 Processar Arquivo/Texto"):
+    # Lógica de Abas do Excel
+    sheet_name = None
+    if uploaded_file and uploaded_file.name.endswith('.xlsx'):
+        try:
+            xl = pd.ExcelFile(uploaded_file)
+            sheets = xl.sheet_names
+            if len(sheets) > 1:
+                sheet_name = st.selectbox("Este arquivo tem várias abas. Escolha qual importar:", sheets)
+            else:
+                sheet_name = sheets[0]
+        except Exception as e:
+            st.error(f"Erro ao ler abas do Excel: {e}")
+
+    if st.button("🚀 Iniciar Análise Inteligente"):
         content = ""
         if uploaded_file:
-            # Tenta ler como utf-8, se falhar, tenta latin-1
-            try:
-                content = uploaded_file.getvalue().decode("utf-8")
-            except:
-                content = uploaded_file.getvalue().decode("latin-1")
+            if uploaded_file.name.endswith('.xlsx'):
+                try:
+                    df_xlsx = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+                    content = df_xlsx.to_csv(index=False)
+                except Exception as e:
+                    st.error(f"Erro ao ler Excel: {e}")
+            else:
+                try:
+                    content = uploaded_file.getvalue().decode("utf-8")
+                except:
+                    content = uploaded_file.getvalue().decode("latin-1")
         elif text_input:
             content = text_input
         
         if content:
-            with st.spinner("A IA está lendo seu extrato e categorizando... (Isso pode levar alguns segundos)"):
-                data = process_statement(content)
+            with st.spinner("A IA está analisando seus dados... (Pode levar alguns segundos)"):
+                # Passa contexto de produtos e sócios para a IA mapear IDs automaticamente
+                ctx = {
+                    "products": get_products(),
+                    "partners": get_partners(),
+                    "companies": get_companies()
+                }
+                data = process_statement(content, entities_context=ctx)
                 
-                if "error" in data:
+                if isinstance(data, dict) and "error" in data:
                     st.error(data["error"])
                 else:
-                    # Converter para DataFrame para edição
-                    df_import = pd.DataFrame(data)
-                    # Converter coluna de data para datetime para o editor funcionar
-                    if "date" in df_import.columns:
-                        df_import["date"] = pd.to_datetime(df_import["date"]).dt.date
+                    # Achatar o JSON da IA para um DataFrame amigável
+                    rows = []
+                    for item in data:
+                        intent = item.get("intent", "SAVE_TRANSACTION")
+                        d = item.get("data", {})
+                        rows.append({
+                            "Intenção": intent,
+                            "Data": d.get("date"),
+                            "Valor": d.get("amount"),
+                            "Descrição": d.get("description"),
+                            "Qtd": d.get("quantity", 1),
+                            "Categoria/Tipo": d.get("category") or d.get("type"),
+                            "ID Produto": d.get("product_id")
+                        })
+                    
+                    df_import = pd.DataFrame(rows)
+                    if "Data" in df_import.columns:
+                        df_import["Data"] = pd.to_datetime(df_import["Data"]).dt.date
                     
                     st.session_state.import_data = df_import
-                    st.success(f"{len(df_import)} transações encontradas!")
+                    st.success(f"{len(df_import)} lançamentos identificados!")
         else:
             st.warning("Por favor, faça upload de um arquivo ou cole o texto.")
 
-    # Se houver dados importados na sessão, mostra editor
+    # Exibição e Confirmação
     if "import_data" in st.session_state and st.session_state.import_data is not None:
         st.divider()
-        st.subheader("Verifique e Corrija")
+        st.subheader("Verifique os Lançamentos Identificados")
         
-        # Editor de dados (Excel-like)
         edited_df = st.data_editor(
             st.session_state.import_data,
             num_rows="dynamic",
             column_config={
-                "amount": st.column_config.NumberColumn("Valor", format="R$ %.2f"),
-                "date": st.column_config.DateColumn("Data", format="YYYY-MM-DD"),
-                "type": st.column_config.SelectboxColumn("Tipo", options=["Receita", "Despesa"]),
-                "category": st.column_config.SelectboxColumn("Categoria", options=[
-                    "Alimentação", "Transporte", "Casa", "Lazer", "Outros", "Salário", "Investimento"
-                ])
+                "Valor": st.column_config.NumberColumn("Valor", format="R$ %.2f"),
+                "Data": st.column_config.DateColumn("Data", format="YYYY-MM-DD"),
+                "Intenção": st.column_config.SelectboxColumn("Ação", options=["REGISTER_SALE", "STOCK_MOVEMENT", "SAVE_TRANSACTION", "PARTNER_CONTRIBUTION"]),
+                "ID Produto": st.column_config.NumberColumn("Prod ID")
             },
             use_container_width=True
         )
 
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("💾 Salvar Tudo no Banco"):
-                if save_transactions_batch(edited_df):
-                    st.success("Tudo salvo com sucesso!")
-                    st.session_state.import_data = None # Limpa após salvar
+            if st.button("💾 Confirmar e Lançar Tudo"):
+                success_count = 0
+                error_count = 0
+                
+                with st.spinner("Processando lançamentos em lote..."):
+                    for _, row in edited_df.iterrows():
+                        intent = row['Intenção']
+                        dt = row['Data']
+                        val = float(row['Valor'] or 0)
+                        desc = row['Descrição']
+                        p_id = row['ID Produto']
+                        qty = int(row['Qtd'] or 1)
+                        cat_or_type = row['Categoria/Tipo']
+
+                        try:
+                            res = None
+                            if intent == "REGISTER_SALE":
+                                if p_id: res = create_sale(int(p_id), qty, val, desc)
+                            elif intent == "STOCK_MOVEMENT":
+                                if p_id: res = add_stock_movement(int(p_id), qty, 'in', desc, unit_cost=val/qty if qty > 0 else 0)
+                            elif intent == "SAVE_TRANSACTION":
+                                q = "INSERT INTO transactions (type, amount, category, description, date) VALUES (%s,%s,%s,%s,%s)"
+                                params = ("Receita" if val > 0 else "Despesa", abs(val), cat_or_type, desc, dt)
+                                res = run_query(q, params)
+                            elif intent == "PARTNER_CONTRIBUTION":
+                                # Tenta pegar o primeiro sócio se não tiver ID
+                                partners = get_partners()
+                                if partners: res = create_contribution(partners[0]['id'], val, str(dt), desc)
+                            
+                            if res: success_count += 1
+                            else: error_count += 1
+                        except:
+                            error_count += 1
+                
+                if success_count > 0:
+                    st.success(f"Sucesso: {success_count} lançamentos realizados!")
+                if error_count > 0:
+                    st.error(f"Erros: {error_count} itens não puderam ser processados.")
+                
+                if success_count > 0:
+                    st.session_state.import_data = None
                     st.balloons()
-                else:
-                    st.error("Erro ao salvar no banco de dados.")
+                    st.rerun()
         
         with col_b:
             if st.button("🗑️ Descartar"):
