@@ -2,34 +2,27 @@
 
 Este projeto é um assistente financeiro que permite registrar despesas e receitas via chat, utilizando IA (Gemini) para entender o que você escreve e salvando tudo em um banco de dados SQL.
 
-## 🚀 Como Rodar
+## 🚀 Como Rodar Localmente (Windows)
+
+O sistema foi preparado para ser instalado com apenas alguns cliques.
 
 ### 1. Pré-requisitos
-Certifique-se de que o **Docker Desktop** está rodando.
+- **Windows 10 ou 11**.
+- **Python 3.10+** (Certifique-se de marcar "Add Python to PATH").
+- **Docker Desktop** instalado e rodando (Para o Banco de Dados).
 
-### 2. Configuração
-1.  Renomeie o arquivo `.env.example` para `.env`.
-2.  Abra o `.env` e coloque sua **GEMINI_API_KEY**.
+### 2. Instalação e Configuração
+1.  Execute o arquivo **`instalar_windows.bat`** com um duplo clique.
+2.  O instalador irá:
+    - Criar o ambiente isolado (venv).
+    - Instalar todas as dependências.
+    - Solicitar sua **GEMINI_API_KEY** (Cole sua chave e dê Enter).
+    - Iniciar o banco de dados via Docker.
+    - Criar um **atalho na área de trabalho** chamado "Agente Financeiro".
 
-### 3. Iniciar o Banco de Dados
-Se ainda não iniciou, rode no terminal:
-```bash
-docker compose up -d
-```
-Isso vai subir o PostgreSQL.
-
-### 4. Inicializar a Tabela
-Apenas na primeira vez, rode:
-```bash
-python database.py
-```
-Isso cria as tabelas iniciais no banco.
-
-### 5. Rodar o App
-```bash
-streamlit run app.py
-```
-O navegador vai abrir automaticamente com o Chat e o Dashboard!
+### 3. Acesso
+- Após a instalação, basta usar o atalho na sua Área de Trabalho ou rodar o arquivo **`run_app.bat`**.
+- O sistema abrirá automaticamente no seu navegador.
 
 ## 🛠 Tecnologias
 -   **Python 3.10+**

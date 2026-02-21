@@ -15,6 +15,7 @@ from db_helpers import (
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
     create_fixed_expense, get_inventory_report, get_revenue_details
 )
+from backup_utils import export_backup, import_backup
 import os
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -651,6 +652,49 @@ with tab4:
             else: st.error("Erro ao agendar.")
         else:
             st.warning("Preencha o nome e selecione a empresa.")
+
+    st.divider()
+    st.subheader("💾 Backup e Restauração de Dados")
+    st.info("Utilize as opções abaixo para garantir a segurança dos seus dados locais.")
+
+    col_b1, col_b2 = st.columns(2)
+    
+    with col_b1:
+        st.write("**Exportar Dados**")
+        st.write("Baixe uma cópia completa de todos os dados do sistema em formato SQL.")
+        if st.button("📤 Gerar Arquivo de Backup", use_container_width=True):
+            with st.spinner("Gerando backup do banco de dados..."):
+                sql_content, result = export_backup()
+                if sql_content:
+                    st.download_button(
+                        label="📥 Baixar Backup agora",
+                        data=sql_content,
+                        file_name=result,
+                        mime="application/sql"
+                    )
+                    st.success("Backup gerado com sucesso!")
+                else:
+                    st.error(f"Erro ao gerar backup: {result}")
+
+    with col_b2:
+        st.write("**Restaurar Dados**")
+        st.write("Substitua os dados atuais enviando um arquivo de backup (.sql).")
+        uploaded_backup = st.file_uploader("Selecione o arquivo .sql", type=["sql"])
+        if uploaded_backup is not None:
+            if st.button("⚠️ Restaurar Backup (Sobrescrever dados)", use_container_width=True):
+                with st.spinner("Restaurando dados..."):
+                    # Para SQLite usamos bytes, para Postgres usamos string
+                    if os.getenv("DB_TYPE", "postgres").lower() == "sqlite":
+                        content = uploaded_backup.getvalue() # Bytes
+                    else:
+                        content = uploaded_backup.getvalue().decode("utf-8") # String
+                        
+                    success, message = import_backup(content)
+                    if success:
+                        st.success(message)
+                        st.balloons()
+                    else:
+                        st.error(f"Erro na restauração: {message}")
 
 # --- TAB 5: EXPORTAR ---
 with tab5:
