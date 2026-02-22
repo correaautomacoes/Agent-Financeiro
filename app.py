@@ -14,7 +14,7 @@ from db_helpers import (
     create_sale, create_contribution, create_withdrawal,
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
     create_fixed_expense, get_inventory_report, get_revenue_details,
-    delete_transaction, get_all_transactions, get_detailed_stock_report,
+    delete_history_item, get_all_transactions, get_detailed_stock_report,
     get_categories, create_category
 )
 from backup_utils import export_backup, import_backup
@@ -141,7 +141,8 @@ with tab1:
                                 product_id=p_id,
                                 quantity=data.get("quantity", 1),
                                 unit_price=data.get("amount", 0) / data.get("quantity", 1) if data.get("quantity", 1) > 0 else 0,
-                                description=data.get("description")
+                                description=data.get("description"),
+                                sale_date=data.get("date")
                             )
                             success = res is not None
                         else:
@@ -253,10 +254,12 @@ with tab_manual:
                 if ultimo_custo > 0:
                     col_i2.success(f"📈 **Lucro desta venda:** R$ {lucro_bruto:.2f}")
                 
-                desc_venda = st.text_input("Observação (opcional)", placeholder="Ex: Venda balcão")
+                col_d1, col_d2 = st.columns(2)
+                data_venda = col_d1.date_input("Data da Venda", value=date.today(), key="v_data")
+                desc_venda = col_d2.text_input("Observação (opcional)", placeholder="Ex: Venda balcão")
                 
                 if st.button("🚀 Registrar Venda", use_container_width=True):
-                    res = create_sale(p_id, qty_venda, preco_venda, desc_venda)
+                    res = create_sale(p_id, qty_venda, preco_venda, description=desc_venda, sale_date=str(data_venda))
                     if res:
                         st.success(f"✅ Venda de R$ {total_venda:.2f} registrada!")
                         st.rerun()
@@ -578,7 +581,7 @@ with tab_history:
         default_date = date.today() - timedelta(days=90)
         date_filter = st.date_input("Filtrar por data inicial", value=default_date)
     with col_f2:
-        type_filter = st.selectbox("Filtrar por tipo", ["Todos", "Receita", "Despesa"])
+        type_filter = st.selectbox("Filtrar por tipo", ["Todos", "Receita", "Despesa", "Estoque"])
     
     # Busca dados
     all_trans = get_all_transactions(limit=300)
@@ -595,13 +598,22 @@ with tab_history:
             # Seleção para deletar
             st.divider()
             st.subheader("🗑️ Cancelar um Lançamento")
-            options = ["Selecione um item..."] + [f"ID: {row['id']} | {row['date']} | {row['type']} | R$ {row['amount']:.2f} | {row['description']}" for _, row in filtered_df.iterrows()]
-            to_delete = st.selectbox("Escolha o lançamento para cancelar:", options)
+            history_records = [None] + filtered_df.to_dict("records")
+            to_delete = st.selectbox(
+                "Escolha o lançamento para cancelar:",
+                history_records,
+                format_func=lambda row: (
+                    "Selecione um item..."
+                    if row is None
+                    else f"[{row.get('source', 'transaction')}] ID: {int(row.get('source_id', row['id']))} | {row['date']} | {row['type']} | R$ {float(row['amount']):.2f} | {row['description']}"
+                )
+            )
             
-            if to_delete != "Selecione um item...":
-                t_id = int(to_delete.split("|")[0].replace("ID: ", "").strip())
+            if to_delete is not None:
+                source = to_delete.get("source", "transaction")
+                source_id = int(to_delete.get("source_id", to_delete["id"]))
                 if st.button("❌ Confirmar Exclusão Definitiva", type="primary"):
-                    if delete_transaction(t_id):
+                    if delete_history_item(source, source_id):
                         st.success("Lançamento cancelado com sucesso!")
                         st.rerun()
                     else:
@@ -651,7 +663,7 @@ with tab3:
             else:
                 try:
                     content = uploaded_file.getvalue().decode("utf-8")
-                except:
+                except UnicodeDecodeError:
                     content = uploaded_file.getvalue().decode("latin-1")
         elif text_input:
             content = text_input
@@ -687,6 +699,7 @@ with tab3:
                         rows.append({
                             "Intenção": intent,
                             "Tipo": tipo,
+                            "Movimento": d.get("type") if d.get("type") in ["in", "out"] else "in",
                             "Data": d.get("date"),
                             "Valor": abs(d.get("amount", 0) or 0),
                             "Descrição": d.get("description"),
@@ -714,6 +727,7 @@ with tab3:
             num_rows="dynamic",
             column_config={
                 "Tipo": st.column_config.SelectboxColumn("Tipo", options=["Receita", "Despesa"], required=True),
+                "Movimento": st.column_config.SelectboxColumn("Movimento", options=["in", "out"], required=True),
                 "Valor": st.column_config.NumberColumn("Valor", format="R$ %.2f"),
                 "Data": st.column_config.DateColumn("Data", format="YYYY-MM-DD"),
                 "Intenção": st.column_config.SelectboxColumn("Ação", options=["REGISTER_SALE", "STOCK_MOVEMENT", "SAVE_TRANSACTION", "PARTNER_CONTRIBUTION"]),
@@ -738,6 +752,9 @@ with tab3:
                         p_id = row['ID Produto']
                         qty = int(row['Qtd'] or 1)
                         categoria = row.get('Categoria', 'Outros')
+                        movimento = row.get('Movimento', 'in')
+                        if movimento not in ['in', 'out']:
+                            movimento = 'in'
                         
                         # Normalização defensiva final do tipo
                         tipo_gravado = row.get('Tipo', '')
@@ -747,9 +764,9 @@ with tab3:
                         try:
                             res = None
                             if intent == "REGISTER_SALE":
-                                if p_id: res = create_sale(int(p_id), qty, val, desc)
+                                if p_id: res = create_sale(int(p_id), qty, val, description=desc, sale_date=str(dt) if dt else None)
                             elif intent == "STOCK_MOVEMENT":
-                                if p_id: res = add_stock_movement(int(p_id), qty, 'in', desc, unit_cost=val/qty if qty > 0 else 0)
+                                if p_id: res = add_stock_movement(int(p_id), qty, movimento, desc, unit_cost=val/qty if qty > 0 else 0)
                             elif intent == "SAVE_TRANSACTION":
                                 q = "INSERT INTO transactions (type, amount, category, description, date) VALUES (%s,%s,%s,%s,%s)"
                                 params = (tipo_gravado, abs(val), categoria, desc, str(dt))
@@ -760,7 +777,8 @@ with tab3:
                             
                             if res: success_count += 1
                             else: error_count += 1
-                        except:
+                        except Exception as e:
+                            print(f"Erro no lote (intent={intent}, data={dt}, produto={p_id}): {e}")
                             error_count += 1
                 
                 if success_count > 0:
@@ -956,11 +974,17 @@ with tab5:
     format_opt = st.radio("Formato de exportação", ["Excel (.xlsx)", "PDF (.pdf)"], key="exp_format")
 
     if st.button("🚀 Gerar Relatório"):
-        date_filter_sql = "" if all_time else f" WHERE date BETWEEN '{start_date}' AND '{end_date}'"
-        date_filter_sql_t = "" if all_time else f" WHERE t.date BETWEEN '{start_date}' AND '{end_date}'"
+        date_filter_sql = ""
+        date_params = None
+        if not all_time:
+            date_filter_sql = " WHERE date BETWEEN %s AND %s"
+            date_params = (str(start_date), str(end_date))
 
         # --- Aba 1: Transações ---
-        rows_trans = run_query(f"SELECT date, type, amount, category, description FROM transactions{date_filter_sql} ORDER BY date DESC")
+        rows_trans = run_query(
+            f"SELECT date, type, amount, category, description FROM transactions{date_filter_sql} ORDER BY date DESC",
+            date_params
+        )
         df_trans = pd.DataFrame(rows_trans) if rows_trans else pd.DataFrame(columns=['date','type','amount','category','description'])
         df_trans.columns = ['Data','Tipo','Valor (R$)','Categoria','Descrição']
 

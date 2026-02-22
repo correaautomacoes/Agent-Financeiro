@@ -4,6 +4,16 @@ from database import get_db_connection, run_query
 
 DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
 
+
+def _safe_limit(limit: int, default: int = 300, maximum: int = 5000) -> int:
+    try:
+        value = int(limit)
+        if value < 1:
+            return default
+        return min(value, maximum)
+    except Exception:
+        return default
+
 def create_company(name: str) -> Optional[int]:
     conn = get_db_connection()
     if not conn:
@@ -100,17 +110,27 @@ def add_stock_movement(product_id: int, quantity: int, movement_type: str, refer
         return None
     try:
         cur = conn.cursor()
+        qty = int(quantity)
+        if qty <= 0:
+            raise Exception("Quantidade deve ser maior que zero.")
+        if movement_type not in ("in", "out"):
+            raise Exception("Tipo de movimento inválido.")
+        if movement_type == "out":
+            avail = get_stock_level(product_id)
+            if avail < qty:
+                raise Exception(f"Estoque insuficiente ({avail})")
+
         ph = "?" if DB_TYPE == "sqlite" else "%s"
         query = f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, source, is_paid, unit_cost) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
         if DB_TYPE == "postgres":
-            cur.execute(query + " RETURNING id", (product_id, quantity, movement_type, reference, source, is_paid, unit_cost))
+            cur.execute(query + " RETURNING id", (product_id, qty, movement_type, reference, source, is_paid, unit_cost))
             mid = cur.fetchone()[0]
         else:
-            cur.execute(query, (product_id, quantity, movement_type, reference, source, is_paid, unit_cost))
+            cur.execute(query, (product_id, qty, movement_type, reference, source, is_paid, unit_cost))
             mid = cur.lastrowid
         
         if movement_type == 'in' and is_paid and unit_cost > 0:
-            total_cost = unit_cost * quantity
+            total_cost = unit_cost * qty
             dt = "CURRENT_DATE" if DB_TYPE == "postgres" else "date('now')"
             cur.execute(f"INSERT INTO transactions (type, amount, category, description, date, product_id) VALUES ('Despesa', {ph}, 'Estoque/Compra', {ph}, {dt}, {ph})", (total_cost, f"Compra: {reference}", product_id))
             
@@ -130,7 +150,15 @@ def get_stock_level(product_id: int) -> int:
         return int(res[0].get("qty", 0))
     return 0
 
-def create_sale(product_id: int, quantity: int, unit_price: float, company_id: Optional[int] = None, partner_id: Optional[int] = None, description: Optional[str] = None) -> Optional[int]:
+def create_sale(
+    product_id: int,
+    quantity: int,
+    unit_price: float,
+    company_id: Optional[int] = None,
+    partner_id: Optional[int] = None,
+    description: Optional[str] = None,
+    sale_date: Optional[str] = None
+) -> Optional[int]:
     conn = get_db_connection()
     if not conn:
         return None
@@ -144,14 +172,16 @@ def create_sale(product_id: int, quantity: int, unit_price: float, company_id: O
         cur.execute(f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference) VALUES ({ph}, {ph}, 'out', {ph})", (product_id, quantity, description))
         
         total = float(unit_price) * int(quantity)
-        dt = "CURRENT_DATE" if DB_TYPE == "postgres" else "date('now')"
-        q = f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) VALUES ('Receita', {ph}, 'Venda', {ph}, {dt}, {ph}, {ph}, {ph})"
+        dt_val = sale_date if sale_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
+        dt_sql = ph if sale_date else dt_val
+        q = f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) VALUES ('Receita', {ph}, 'Venda', {ph}, {dt_sql}, {ph}, {ph}, {ph})"
+        params = (total, description, sale_date, product_id, partner_id, company_id) if sale_date else (total, description, product_id, partner_id, company_id)
         
         if DB_TYPE == "postgres":
-            cur.execute(q + " RETURNING id", (total, description, product_id, partner_id, company_id))
+            cur.execute(q + " RETURNING id", params)
             tid = cur.fetchone()[0]
         else:
-            cur.execute(q, (total, description, product_id, partner_id, company_id))
+            cur.execute(q, params)
             tid = cur.lastrowid
             
         conn.commit()
@@ -237,8 +267,10 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
     FROM partners p
     """
     if company_id:
-        query += f" WHERE p.company_id = {company_id}"
-    res = run_query(query) or []
+        query += " WHERE p.company_id = %s"
+        res = run_query(query, (company_id,)) or []
+    else:
+        res = run_query(query) or []
     
     # CMV global (custo dos produtos vendidos)
     cmv_res = run_query("""
@@ -334,16 +366,14 @@ def get_revenue_details():
     return res
 
 def get_expense_types(company_id=None):
-    q = "SELECT * FROM expense_types"
     if company_id:
-        q += f" WHERE company_id = {company_id}"
-    return run_query(q) or []
+        return run_query("SELECT * FROM expense_types WHERE company_id = %s", (company_id,)) or []
+    return run_query("SELECT * FROM expense_types") or []
 
 def get_income_types(company_id=None):
-    q = "SELECT * FROM income_types"
     if company_id:
-        q += f" WHERE company_id = {company_id}"
-    return run_query(q) or []
+        return run_query("SELECT * FROM income_types WHERE company_id = %s", (company_id,)) or []
+    return run_query("SELECT * FROM income_types") or []
 
 def get_categories(tipo: str) -> List[str]:
     """Retorna lista de nomes de categoria para 'Receita' ou 'Despesa'."""
@@ -362,23 +392,98 @@ def create_category(tipo: str, name: str, company_id: int = 1) -> bool:
     return res is True
 
 def delete_transaction(transaction_id: int) -> bool:
-    """Deleta um lançamento financeiro pelo ID."""
-    res = run_query("DELETE FROM transactions WHERE id = %s", (transaction_id,))
+    """Compatibilidade: remove um item financeiro e reverte estoque em caso de venda."""
+    return delete_history_item("transaction", transaction_id)
+
+
+def delete_history_item(source: str, record_id: int) -> bool:
+    """
+    Remove item do histórico.
+    - source='transaction': remove transação; se for venda, remove também 1 saída de estoque correlata.
+    - source='stock': remove movimentação de estoque diretamente.
+    """
+    if source == "stock":
+        mv_rows = run_query(
+            "SELECT id, product_id, movement_type, reference FROM stock_movements WHERE id = %s",
+            (record_id,)
+        ) or []
+        if not mv_rows:
+            return False
+        mv = mv_rows[0]
+        # Se for saída de estoque ligada à venda, remove também a transação de receita correspondente.
+        if mv.get("movement_type") == "out" and mv.get("product_id"):
+            if mv.get("reference"):
+                tx = run_query(
+                    "SELECT id FROM transactions WHERE type='Receita' AND category='Venda' AND product_id = %s AND description = %s ORDER BY id DESC LIMIT 1",
+                    (mv["product_id"], mv["reference"])
+                ) or []
+            else:
+                tx = run_query(
+                    "SELECT id FROM transactions WHERE type='Receita' AND category='Venda' AND product_id = %s ORDER BY id DESC LIMIT 1",
+                    (mv["product_id"],)
+                ) or []
+            if tx:
+                run_query("DELETE FROM transactions WHERE id = %s", (tx[0]["id"],))
+        res = run_query("DELETE FROM stock_movements WHERE id = %s", (record_id,))
+        return res is True
+
+    tx_rows = run_query(
+        "SELECT id, type, category, product_id, description FROM transactions WHERE id = %s",
+        (record_id,)
+    ) or []
+    if not tx_rows:
+        return False
+
+    tx = tx_rows[0]
+    # Venda: ao cancelar a transação, desfaz também a saída de estoque correspondente.
+    if tx.get("type") == "Receita" and tx.get("category") == "Venda" and tx.get("product_id"):
+        product_id = tx.get("product_id")
+        description = tx.get("description")
+        if description:
+            mv = run_query(
+                "SELECT id FROM stock_movements WHERE product_id = %s AND movement_type='out' AND reference = %s ORDER BY id DESC LIMIT 1",
+                (product_id, description)
+            ) or []
+        else:
+            mv = run_query(
+                "SELECT id FROM stock_movements WHERE product_id = %s AND movement_type='out' ORDER BY id DESC LIMIT 1",
+                (product_id,)
+            ) or []
+        if mv:
+            run_query("DELETE FROM stock_movements WHERE id = %s", (mv[0]["id"],))
+
+    res = run_query("DELETE FROM transactions WHERE id = %s", (record_id,))
     return res is True
 
 def get_all_transactions(limit: int = 300) -> List[Dict[str, Any]]:
     """Busca o histórico unificado (financeiro e estoque), garantindo visibilidade total."""
     # SQLite usa date('now'), Postgres usa CURRENT_DATE. Usamos coalesce e formatos compatíveis.
     # Usamos LEFT JOIN para garantir que movimentos de estoque sem produto (ou com produto deletado) apareçam.
+    safe_limit = _safe_limit(limit)
     query = f"""
-    SELECT id, CAST(date AS TEXT) as date, type, amount, category, description FROM transactions
+    SELECT
+        id,
+        CAST(date AS TEXT) as date,
+        type,
+        amount,
+        category,
+        description,
+        'transaction' as source,
+        id as source_id
+    FROM transactions
     UNION ALL
-    SELECT m.id, CAST(date(m.created_at) AS TEXT) as date, 'Estoque' as type, 
-           (COALESCE(m.unit_cost, 0) * m.quantity) as amount, m.movement_type as category, 
-           COALESCE(p.name, 'Produto Removido') || ' (' || COALESCE(m.reference, '') || ')' as description 
+    SELECT
+        m.id,
+        CAST(date(m.created_at) AS TEXT) as date,
+        'Estoque' as type,
+        (COALESCE(m.unit_cost, 0) * m.quantity) as amount,
+        m.movement_type as category,
+        COALESCE(p.name, 'Produto Removido') || ' (' || COALESCE(m.reference, '') || ')' as description,
+        'stock' as source,
+        m.id as source_id
     FROM stock_movements m
     LEFT JOIN products p ON m.product_id = p.id
-    ORDER BY date DESC, id DESC LIMIT {limit}
+    ORDER BY date DESC, id DESC LIMIT {safe_limit}
     """
     return run_query(query) or []
 
