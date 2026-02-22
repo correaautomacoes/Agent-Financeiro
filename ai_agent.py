@@ -173,11 +173,19 @@ def process_statement(file_content, entities_context=None):
         Você é um analista de dados especialista em ERP. Sua missão é ler o conteúdo de uma planilha e extrair TODAS as movimentações.
         Hoje é: {today} {entities_str}
         
-        REGRAS DE IDENTIFICAÇÃO:
-        1. Se a linha contiver palavras como "venda", "cupom", "cliente", "pedido" -> Intenção: `REGISTER_SALE`
-        2. Se a linha contiver "entrada", "compra", "fornecedor", "chegada de mercadoria" -> Intenção: `STOCK_MOVEMENT` (type='in')
-        3. Se for pagamento de conta, aluguel, recebimento genérico, luz, telefone -> Intenção: `SAVE_TRANSACTION`
-        4. Se for aporte ou retirada de sócio -> `PARTNER_CONTRIBUTION` ou `PARTNER_WITHDRAWAL`.
+        REGRAS OBRIGATÓRIAS DE TIPO (CRÍTICO - NUNCA VIOLÁ-LAS):
+        - O campo "type" DEVE ser EXATAMENTE "Receita" OU "Despesa". NUNCA outro valor.
+        - "Receita": dinheiro que ENTROU no caixa. Ex: recebimento de venda, serviço pago.
+        - "Despesa": dinheiro que SAIU do caixa. Ex: aluguel, compra de insumo, combustível, salário, qualquer custo/gasto.
+        - Se a linha tem palavras como: "compra", "pagamento", "custo", "aluguel", "salário", "despesa", "gasto" -> type = "Despesa"
+        - O campo "category" é SEPARADO e pode ter qualquer texto descritivo da categoria original.
+        
+        REGRAS DE INTENÇÃO:
+        1. Se a linha contiver "venda", "cupom", "cliente", "pedido" -> Intent: `REGISTER_SALE`
+        2. Se a linha contiver "entrada estoque", "fornecedor", "chegada de mercadoria" -> Intent: `STOCK_MOVEMENT` (type='in')
+        3. Se for qualquer saída de caixa (custos, despesas) -> Intent: `SAVE_TRANSACTION`, type = "Despesa"
+        4. Se for receita/entrada de caixa genérica -> Intent: `SAVE_TRANSACTION`, type = "Receita"
+        5. Aporte de sócio -> `PARTNER_CONTRIBUTION` | Retirada de sócio -> `PARTNER_WITHDRAWAL`
         
         MAPEAMENTO DE PRODUTOS:
         - Se identificar um nome de produto, procure nas 'Entidades Existentes'. Se achar, use o 'product_id'.
@@ -190,15 +198,15 @@ def process_statement(file_content, entities_context=None):
         SAÍDA (JSON Puro - Lista de Intenções):
         [
             {{
-                "intent": "NOME_DA_INTENCAO",
+                "intent": "SAVE_TRANSACTION",
                 "data": {{
                     "date": "YYYY-MM-DD",
-                    "amount": float,
-                    "description": "Descrição original",
-                    "quantity": int (se aplicável),
-                    "product_id": int (se identificado),
-                    "type": "Receita" | "Despesa" | "in" | "out",
-                    "category": "Categoria sugerida"
+                    "amount": 100.00,
+                    "description": "Aluguel Sala",
+                    "type": "Despesa",
+                    "category": "Custos Fixos",
+                    "quantity": null,
+                    "product_id": null
                 }}
             }},
             ...

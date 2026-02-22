@@ -230,17 +230,30 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
     query = """
     SELECT 
         p.id, p.name, p.share_pct,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita' AND company_id = p.company_id) AS total_revenue,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa' AND company_id = p.company_id) AS total_expenses,
-        (SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE partner_id = p.id) AS total_withdrawn
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita') AS total_revenue,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa') AS total_expenses,
+        (SELECT COALESCE(SUM(c.amount), 0) FROM contributions c WHERE c.partner_id = p.id) AS total_contributed,
+        (SELECT COALESCE(SUM(w.amount), 0) FROM withdrawals w WHERE w.partner_id = p.id) AS total_withdrawn
     FROM partners p
     """
     if company_id:
         query += f" WHERE p.company_id = {company_id}"
     res = run_query(query) or []
+    
+    # CMV global (custo dos produtos vendidos)
+    cmv_res = run_query("""
+        SELECT COALESCE(SUM(m.unit_cost * m.quantity), 0) as cmv
+        FROM stock_movements m WHERE m.movement_type = 'out' AND m.unit_cost > 0
+    """)
+    cmv_total = float(cmv_res[0]['cmv']) if cmv_res else 0.0
+    
     for r in res:
-        r['share_of_profit'] = (r['total_revenue'] - r['total_expenses']) * (r['share_pct'] / 100.0)
-        r['current_balance'] = r['share_of_profit'] - r['total_withdrawn']
+        # Lucro real = Receita - Despesas - CMV
+        lucro_real = float(r['total_revenue']) - float(r['total_expenses']) - cmv_total
+        # Cota do sócio no lucro operacional
+        r['share_of_profit'] = lucro_real * (float(r['share_pct']) / 100.0)
+        # Saldo = Cota no lucro + aportes feitos - retiradas já feitas
+        r['current_balance'] = r['share_of_profit'] + float(r['total_contributed']) - float(r['total_withdrawn'])
     return res
 
 def get_advanced_kpis(period: str = 'month'):
@@ -253,11 +266,42 @@ def get_advanced_kpis(period: str = 'month'):
         elif period == 'month': filter_sql = "strftime('%m', date) = strftime('%m', 'now')"
         else: filter_sql = "strftime('%Y', date) = strftime('%Y', 'now')"
     
-    q = f"SELECT COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE 0 END), 0) AS revenue, COALESCE(SUM(CASE WHEN type='Despesa' THEN amount ELSE 0 END), 0) AS expenses, (SELECT COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE -amount END), 0) FROM transactions) AS total_cash FROM transactions WHERE {filter_sql}"
-    res = run_query(q)
-    if res and len(res) > 0:
-        res[0]['net_profit'] = res[0]['revenue'] - res[0]['expenses']
-    return res
+    # Receita e despesas do período
+    q_period = f"""SELECT 
+        COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE 0 END), 0) AS revenue,
+        COALESCE(SUM(CASE WHEN type='Despesa' THEN amount ELSE 0 END), 0) AS expenses
+    FROM transactions WHERE {filter_sql}"""
+    
+    # Saldo total do caixa: todas as receitas - todas as despesas + aportes de sócios - retiradas de sócios
+    q_cash = """
+    SELECT 
+        (SELECT COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE -amount END), 0) FROM transactions)
+        + (SELECT COALESCE(SUM(amount), 0) FROM contributions)
+        - (SELECT COALESCE(SUM(amount), 0) FROM withdrawals)
+    AS total_cash
+    """
+    
+    # CMV: custo dos produtos vendidos (saídas de estoque com custo registrado)
+    q_cmv = f"""
+    SELECT COALESCE(SUM(m.unit_cost * m.quantity), 0) as cmv
+    FROM stock_movements m
+    JOIN products p ON m.product_id = p.id
+    WHERE m.movement_type = 'out' AND m.unit_cost > 0
+    """
+    
+    res_period = run_query(q_period)
+    res_cash = run_query(q_cash)
+    res_cmv = run_query(q_cmv)
+    
+    if res_period and len(res_period) > 0:
+        r = res_period[0]
+        r['total_cash'] = res_cash[0]['total_cash'] if res_cash else 0
+        cmv = float(res_cmv[0]['cmv']) if res_cmv else 0
+        # Lucro real = Receita - Despesas - CMV (Custo dos produtos vendidos)
+        r['net_profit'] = float(r['revenue']) - float(r['expenses']) - cmv
+        r['cmv'] = cmv
+        return [r]
+    return None
 
 def get_upcoming_alerts():
     day_fn = "EXTRACT(DAY FROM CURRENT_DATE)" if DB_TYPE == "postgres" else "strftime('%d', 'now')"
@@ -269,15 +313,20 @@ def get_inventory_report():
     SELECT 
         p.id, p.name, p.price,
         COALESCE(SUM(CASE WHEN m.movement_type='in' THEN m.quantity ELSE -m.quantity END), 0) as stock_qty,
-        COALESCE(MAX(m.unit_cost), 0) as last_cost
+        COALESCE(MAX(CASE WHEN m.movement_type='in' THEN m.unit_cost ELSE NULL END), 0) as last_cost
     FROM products p
     LEFT JOIN stock_movements m ON p.id = m.product_id
     GROUP BY p.id, p.name, p.price
     """
     res = run_query(query) or []
     for r in res:
-        r['total_cost_value'] = r['last_cost'] * r['stock_qty']
-        r['total_sale_value'] = r['price'] * r['stock_qty']
+        qty = max(int(r['stock_qty']), 0)
+        last_cost = float(r['last_cost'] or 0)
+        price = float(r['price'] or 0)
+        # Mostra valor total se há estoque, ou valor unitário se estoque zerado (pra nunca aparecer R$0,00)
+        r['total_cost_value'] = last_cost * qty if qty > 0 else last_cost
+        r['total_sale_value'] = price * qty if qty > 0 else price
+        r['stock_qty'] = qty
     return res
 
 def get_revenue_details():
@@ -296,20 +345,59 @@ def get_income_types(company_id=None):
         q += f" WHERE company_id = {company_id}"
     return run_query(q) or []
 
+def get_categories(tipo: str) -> List[str]:
+    """Retorna lista de nomes de categoria para 'Receita' ou 'Despesa'."""
+    table = "income_types" if tipo == "Receita" else "expense_types"
+    res = run_query(f"SELECT name FROM {table} ORDER BY name") or []
+    return [r['name'] for r in res]
+
+def create_category(tipo: str, name: str, company_id: int = 1) -> bool:
+    """Cria uma nova categoria de Receita ou Despesa se não existir."""
+    table = "income_types" if tipo == "Receita" else "expense_types"
+    ph = "?" if DB_TYPE == "sqlite" else "%s"
+    existing = run_query(f"SELECT id FROM {table} WHERE name = {ph}", (name,))
+    if existing:
+        return True  # já existe
+    res = run_query(f"INSERT INTO {table} (company_id, name) VALUES ({ph}, {ph})", (company_id, name))
+    return res is True
+
 def delete_transaction(transaction_id: int) -> bool:
     """Deleta um lançamento financeiro pelo ID."""
     res = run_query("DELETE FROM transactions WHERE id = %s", (transaction_id,))
     return res is True
 
-def get_all_transactions(limit: int = 200) -> List[Dict[str, Any]]:
-    """Busca o histórico unificado (financeiro e estoque)."""
-    # Busca transações financeiras e movimentos de estoque
+def get_all_transactions(limit: int = 300) -> List[Dict[str, Any]]:
+    """Busca o histórico unificado (financeiro e estoque), garantindo visibilidade total."""
+    # SQLite usa date('now'), Postgres usa CURRENT_DATE. Usamos coalesce e formatos compatíveis.
+    # Usamos LEFT JOIN para garantir que movimentos de estoque sem produto (ou com produto deletado) apareçam.
     query = f"""
-    SELECT id, date, type, amount, category, description FROM transactions
+    SELECT id, CAST(date AS TEXT) as date, type, amount, category, description FROM transactions
     UNION ALL
-    SELECT m.id, date(m.created_at) as date, 'Estoque' as type, (m.unit_cost * m.quantity) as amount, m.movement_type as category, p.name || ' (' || m.reference || ')' as description 
+    SELECT m.id, CAST(date(m.created_at) AS TEXT) as date, 'Estoque' as type, 
+           (COALESCE(m.unit_cost, 0) * m.quantity) as amount, m.movement_type as category, 
+           COALESCE(p.name, 'Produto Removido') || ' (' || COALESCE(m.reference, '') || ')' as description 
     FROM stock_movements m
-    JOIN products p ON m.product_id = p.id
+    LEFT JOIN products p ON m.product_id = p.id
     ORDER BY date DESC, id DESC LIMIT {limit}
     """
     return run_query(query) or []
+
+def get_detailed_stock_report() -> List[Dict[str, Any]]:
+    """Relatório para a aba de gestão: o que temos, o que saiu e valores."""
+    query = """
+    SELECT 
+        p.id, p.sku, p.name, p.price,
+        COALESCE(SUM(CASE WHEN m.movement_type='in' THEN m.quantity ELSE 0 END), 0) as total_in,
+        COALESCE(SUM(CASE WHEN m.movement_type='out' THEN m.quantity ELSE 0 END), 0) as total_out,
+        COALESCE(SUM(CASE WHEN m.movement_type='in' THEN m.quantity ELSE -m.quantity END), 0) as current_stock,
+        COALESCE(MAX(m.unit_cost), 0) as last_cost
+    FROM products p
+    LEFT JOIN stock_movements m ON p.id = m.product_id
+    GROUP BY p.id, p.sku, p.name, p.price
+    ORDER BY current_stock DESC
+    """
+    res = run_query(query) or []
+    for r in res:
+        r['stock_value_cost'] = float(r['last_cost']) * int(r['current_stock'])
+        r['stock_value_sale'] = float(r['price']) * int(r['current_stock'])
+    return res

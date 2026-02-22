@@ -14,7 +14,8 @@ from db_helpers import (
     create_sale, create_contribution, create_withdrawal,
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
     create_fixed_expense, get_inventory_report, get_revenue_details,
-    delete_transaction, get_all_transactions
+    delete_transaction, get_all_transactions, get_detailed_stock_report,
+    get_categories, create_category
 )
 from backup_utils import export_backup, import_backup
 import os
@@ -28,7 +29,7 @@ st.set_page_config(page_title="Agente Financeiro", page_icon="💰", layout="wid
 st.title("💰 Agente Financeiro Inteligente")
 
 # Abas para separar Chat, Lançamentos, Dashboard, Histórico, Importação e Gerenciamento
-tab1, tab_manual, tab2, tab_history, tab3, tab4, tab5 = st.tabs(["💬 Chat", "📝 Lançamentos", "📊 Dashboard", "📜 Histórico", "📂 Importar", "⚙️ Gerenciar", "📤 Exportar"])
+tab1, tab_manual, tab2, tab_stock, tab_history, tab3, tab4, tab5 = st.tabs(["💬 Chat", "📝 Lançamentos", "📊 Dashboard", "📦 Estoque", "📜 Histórico", "📂 Importar", "⚙️ Gerenciar", "📤 Exportar"])
 
 # --- TAB 1: CHAT ---
 with tab1:
@@ -218,39 +219,89 @@ with tab_manual:
     with sub_tab1:
         st.subheader("Registrar Venda")
         prods = get_products()
-        p_options = {f"{p['name']} (R$ {p['price']})": p['id'] for p in prods}
-        selected_p = st.selectbox("Selecione o Produto", options=["-"] + list(p_options.keys()))
-        qty_venda = st.number_input("Quantidade", min_value=1, value=1)
-        desc_venda = st.text_input("Observação (opcional)", placeholder="Ex: Venda balcão")
-        
-        if st.button("🚀 Registrar Venda", use_container_width=True):
+        if not prods:
+            st.warning("Nenhum produto cadastrado. Vá em 'Estoque' para criar produtos.")
+        else:
+            prods_dict = {p['id']: p for p in prods}
+            p_options = {f"{p['name']} (Padrão: R$ {float(p['price']):.2f})": p['id'] for p in prods}
+            selected_p = st.selectbox("Selecione o Produto", options=["-"] + list(p_options.keys()))
+            
             if selected_p != "-":
                 p_id = p_options[selected_p]
-                # Pega o preço unitário do nome ou do banco
-                p_obj = next(p for p in prods if p['id'] == p_id)
-                res = create_sale(p_id, qty_venda, p_obj['price'], desc_venda)
-                if res:
-                    st.success("Venda registrada e estoque atualizado!")
-                else:
-                    st.error("Erro ao registrar venda. Verifique o estoque.")
-            else:
-                st.warning("Selecione um produto.")
+                p_obj = prods_dict[p_id]
+                
+                col_v1, col_v2 = st.columns(2)
+                qty_venda = col_v1.number_input("Quantidade", min_value=1, value=1, key="v_qty")
+                preco_venda = col_v2.number_input(
+                    "Preço Unit. de Venda (R$)",
+                    min_value=0.01, step=0.01,
+                    value=float(p_obj['price']),
+                    help="Pode alterar o preço para esta venda específica."
+                )
+                
+                # Preview do lucro
+                ultimo_custo_res = run_query(
+                    "SELECT unit_cost FROM stock_movements WHERE product_id = %s AND movement_type='in' AND unit_cost > 0 ORDER BY id DESC LIMIT 1",
+                    (p_id,)
+                )
+                ultimo_custo = float(ultimo_custo_res[0]['unit_cost']) if ultimo_custo_res else 0.0
+                total_venda = preco_venda * qty_venda
+                lucro_bruto = (preco_venda - ultimo_custo) * qty_venda
+                
+                col_i1, col_i2 = st.columns(2)
+                col_i1.info(f"💰 **Total da Venda:** R$ {total_venda:.2f}")
+                if ultimo_custo > 0:
+                    col_i2.success(f"📈 **Lucro desta venda:** R$ {lucro_bruto:.2f}")
+                
+                desc_venda = st.text_input("Observação (opcional)", placeholder="Ex: Venda balcão")
+                
+                if st.button("🚀 Registrar Venda", use_container_width=True):
+                    res = create_sale(p_id, qty_venda, preco_venda, desc_venda)
+                    if res:
+                        st.success(f"✅ Venda de R$ {total_venda:.2f} registrada!")
+                        st.rerun()
+                    else:
+                        st.error("Erro ao registrar venda. Verifique o estoque disponível.")
 
     with sub_tab2:
         st.subheader("Nova Receita ou Despesa")
         tipo_f = st.radio("Tipo", ["Receita", "Despesa"], horizontal=True)
         valor_f = st.number_input("Valor (R$)", min_value=0.01, step=0.01)
-        cat_f = st.text_input("Categoria", placeholder="Ex: Aluguel, Marketing, Venda direta")
+        
+        # Dropdown dinâmico de categorias
+        cats_disponiveis = get_categories(tipo_f)
+        opcao_cat = st.selectbox(
+            "Categoria",
+            options=cats_disponiveis + ["➕ Criar nova categoria..."],
+            help="Selecione uma categoria existente ou crie uma nova."
+        )
+        
+        cat_f = opcao_cat
+        if opcao_cat == "➕ Criar nova categoria...":
+            nova_cat = st.text_input("Nome da nova categoria", placeholder="Ex: Marketing, Energia, Consultoria")
+            cat_f = nova_cat
+        
         desc_f = st.text_area("Descrição", placeholder="Detalhes do lançamento...")
         data_f = st.date_input("Data", value=date.today())
         
         if st.button("➕ Salvar no Financeiro", use_container_width=True):
-            q = "INSERT INTO transactions (type, amount, category, description, date) VALUES (%s,%s,%s,%s,%s)"
-            params = (tipo_f, valor_f, cat_f, desc_f, data_f)
-            if run_query(q, params):
-                st.success(f"{tipo_f} lançada com sucesso!")
+            if not cat_f or cat_f == "➕ Criar nova categoria...":
+                st.warning("Por favor, informe o nome da nova categoria antes de salvar.")
             else:
-                st.error("Erro ao salvar lançamento.")
+                # Cria a categoria se for nova
+                if opcao_cat == "➕ Criar nova categoria...":
+                    companies = get_companies()
+                    comp_id = companies[0]['id'] if companies else 1
+                    create_category(tipo_f, cat_f, comp_id)
+                
+                q = "INSERT INTO transactions (type, amount, category, description, date) VALUES (%s,%s,%s,%s,%s)"
+                params = (tipo_f, valor_f, cat_f, desc_f, data_f)
+                if run_query(q, params):
+                    st.success(f"{tipo_f} lançada com sucesso!")
+                    st.rerun()
+                else:
+                    st.error("Erro ao salvar lançamento.")
+
 
     with sub_tab3:
         st.subheader("Entrada ou Saída de Peças")
@@ -372,20 +423,22 @@ with tab2:
     total_inv_sale = sum([item.get('total_sale_value', 0) for item in inv_data]) if inv_data else 0
 
     # KPIs Principais
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     if kpi_data:
         k = kpi_data[0]
-        c1.metric("Faturamento", f"R$ {k.get('revenue', 0):.2f}")
-        c2.metric("Despesas", f"R$ {k.get('expenses', 0):.2f}", delta_color="inverse")
-        c3.metric("Lucro Líquido", f"R$ {k.get('net_profit', 0):.2f}")
-        c4.metric("Valor em Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
-        c5.metric("💰 Saldo Total", f"R$ {k.get('total_cash', 0):.2f}")
+        c1.metric("📈 Faturamento", f"R$ {float(k.get('revenue', 0)):.2f}")
+        c2.metric("📉 Despesas", f"R$ {float(k.get('expenses', 0)):.2f}", delta_color="inverse")
+        c3.metric("🏷️ CMV (Custo Vendas)", f"R$ {float(k.get('cmv', 0)):.2f}", delta_color="inverse")
+        c4.metric("💡 Lucro Líquido", f"R$ {float(k.get('net_profit', 0)):.2f}")
+        c5.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
+        c6.metric("💰 Saldo em Caixa", f"R$ {float(k.get('total_cash', 0)):.2f}")
     else:
-        c1.metric("Faturamento", "R$ 0.00")
-        c2.metric("Despesas", "R$ 0.00")
-        c3.metric("Lucro Líquido", "R$ 0.00")
-        c4.metric("Valor em Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
-        c5.metric("💰 Saldo Total", "R$ 0.00")
+        c1.metric("📈 Faturamento", "R$ 0.00")
+        c2.metric("📉 Despesas", "R$ 0.00")
+        c3.metric("🏷️ CMV (Custo Vendas)", "R$ 0.00")
+        c4.metric("💡 Lucro Líquido", "R$ 0.00")
+        c5.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
+        c6.metric("💰 Saldo em Caixa", "R$ 0.00")
 
     # Alertas
     alerts = get_upcoming_alerts()
@@ -474,6 +527,44 @@ with tab2:
             st.subheader("Faturamento Mensal")
             st.plotly_chart(px.bar(df, x='date', y='amount', color='type', barmode='group'), use_container_width=True)
 
+# --- TAB: ESTOQUE ---
+with tab_stock:
+    st.header("📦 Gestão de Estoque Detalhada")
+    st.markdown("Controle o que está disponível, o que já foi vendido e os valores imobilizados.")
+
+    stock_data = get_detailed_stock_report()
+    if stock_data:
+        df_stock = pd.DataFrame(stock_data)
+        
+        # KPIs de Estoque
+        total_items = df_stock['current_stock'].sum()
+        total_cost = df_stock['stock_value_cost'].sum()
+        total_sale = df_stock['stock_value_sale'].sum()
+        
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Itens Disponíveis", int(total_items))
+        k2.metric("Valor em Estoque (Custo)", f"R$ {total_cost:.2f}")
+        k3.metric("Valor em Estoque (Venda)", f"R$ {total_sale:.2f}")
+
+        st.divider()
+        
+        # Tabela Detalhada
+        st.subheader("📋 Inventário Completo")
+        # Mostrar Vendidos (Total Out) e Disponíveis (Current Stock)
+        display_stock = df_stock[['sku', 'name', 'total_in', 'total_out', 'current_stock', 'price', 'last_cost']].copy()
+        display_stock.columns = ['SKU', 'Produto', 'Entradas', 'Vendas/Saídas', 'Disponível', 'Preço Venda', 'Último Custo']
+        
+        st.dataframe(
+            display_stock.style.format({
+                'Preço Venda': 'R$ {:.2f}',
+                'Último Custo': 'R$ {:.2f}'
+            }), 
+            use_container_width=True, 
+            hide_index=True
+        )
+    else:
+        st.info("Nenhum produto com movimentação de estoque encontrado.")
+
 # --- TAB: HISTÓRICO ---
 with tab_history:
     st.header("📜 Histórico de Lançamentos")
@@ -482,8 +573,10 @@ with tab_history:
     # Filtros
     col_f1, col_f2, col_f3 = st.columns(3)
     with col_f1:
-        # Padrão: primeiro dia do mês atual para garantir que os lançamentos recentes apareçam
-        date_filter = st.date_input("Filtrar por data inicial", value=date.today().replace(day=1))
+        # Padrão: 90 dias atrás para garantir que migrações apareçam
+        from datetime import timedelta
+        default_date = date.today() - timedelta(days=90)
+        date_filter = st.date_input("Filtrar por data inicial", value=default_date)
     with col_f2:
         type_filter = st.selectbox("Filtrar por tipo", ["Todos", "Receita", "Despesa"])
     
@@ -581,19 +674,30 @@ with tab3:
                     for item in data:
                         intent = item.get("intent", "SAVE_TRANSACTION")
                         d = item.get("data", {})
+                        
+                        # Normalizar type: garante que seja sempre Receita ou Despesa
+                        raw_type = d.get("type", "")
+                        if isinstance(raw_type, str) and raw_type.strip() in ["Receita", "Despesa"]:
+                            tipo = raw_type.strip()
+                        else:
+                            # Tenta inferir pelo valor: valores negativos = despesa
+                            val = d.get("amount", 0)
+                            tipo = "Receita" if (isinstance(val, (int, float)) and val >= 0) else "Despesa"
+                        
                         rows.append({
                             "Intenção": intent,
+                            "Tipo": tipo,
                             "Data": d.get("date"),
-                            "Valor": d.get("amount"),
+                            "Valor": abs(d.get("amount", 0) or 0),
                             "Descrição": d.get("description"),
                             "Qtd": d.get("quantity", 1),
-                            "Categoria/Tipo": d.get("category") or d.get("type"),
+                            "Categoria": d.get("category", "Outros"),
                             "ID Produto": d.get("product_id")
                         })
                     
                     df_import = pd.DataFrame(rows)
                     if "Data" in df_import.columns:
-                        df_import["Data"] = pd.to_datetime(df_import["Data"]).dt.date
+                        df_import["Data"] = pd.to_datetime(df_import["Data"], errors='coerce').dt.date
                     
                     st.session_state.import_data = df_import
                     st.success(f"{len(df_import)} lançamentos identificados!")
@@ -609,9 +713,11 @@ with tab3:
             st.session_state.import_data,
             num_rows="dynamic",
             column_config={
+                "Tipo": st.column_config.SelectboxColumn("Tipo", options=["Receita", "Despesa"], required=True),
                 "Valor": st.column_config.NumberColumn("Valor", format="R$ %.2f"),
                 "Data": st.column_config.DateColumn("Data", format="YYYY-MM-DD"),
                 "Intenção": st.column_config.SelectboxColumn("Ação", options=["REGISTER_SALE", "STOCK_MOVEMENT", "SAVE_TRANSACTION", "PARTNER_CONTRIBUTION"]),
+                "Categoria": st.column_config.TextColumn("Categoria"),
                 "ID Produto": st.column_config.NumberColumn("Prod ID")
             },
             use_container_width=True
@@ -631,7 +737,12 @@ with tab3:
                         desc = row['Descrição']
                         p_id = row['ID Produto']
                         qty = int(row['Qtd'] or 1)
-                        cat_or_type = row['Categoria/Tipo']
+                        categoria = row.get('Categoria', 'Outros')
+                        
+                        # Normalização defensiva final do tipo
+                        tipo_gravado = row.get('Tipo', '')
+                        if tipo_gravado not in ['Receita', 'Despesa']:
+                            tipo_gravado = 'Despesa'  # padrão seguro
 
                         try:
                             res = None
@@ -641,10 +752,9 @@ with tab3:
                                 if p_id: res = add_stock_movement(int(p_id), qty, 'in', desc, unit_cost=val/qty if qty > 0 else 0)
                             elif intent == "SAVE_TRANSACTION":
                                 q = "INSERT INTO transactions (type, amount, category, description, date) VALUES (%s,%s,%s,%s,%s)"
-                                params = ("Receita" if val > 0 else "Despesa", abs(val), cat_or_type, desc, dt)
+                                params = (tipo_gravado, abs(val), categoria, desc, str(dt))
                                 res = run_query(q, params)
                             elif intent == "PARTNER_CONTRIBUTION":
-                                # Tenta pegar o primeiro sócio se não tiver ID
                                 partners = get_partners()
                                 if partners: res = create_contribution(partners[0]['id'], val, str(dt), desc)
                             
@@ -833,8 +943,8 @@ with tab4:
 
 # --- TAB 5: EXPORTAR ---
 with tab5:
-    st.header("📤 Exportar Dados")
-    st.write("Escolha o período e o formato para exportar as transações.")
+    st.header("📤 Exportar Relatório Completo")
+    st.write("Gere um relatório profissional com transações, lucro por produto e movimentações de sócios.")
 
     col_e1, col_e2 = st.columns(2)
     with col_e1:
@@ -843,81 +953,192 @@ with tab5:
         end_date = st.date_input("Data Fim", value=date.today(), key="exp_end")
 
     all_time = st.checkbox("Exportar tudo (ignorar datas)", key="exp_all")
-
     format_opt = st.radio("Formato de exportação", ["Excel (.xlsx)", "PDF (.pdf)"], key="exp_format")
 
-    if st.button("🚀 Gerar Arquivo para Exportação"):
-        query = "SELECT * FROM transactions"
-        params = ()
-        if not all_time:
-            query += " WHERE date BETWEEN %s AND %s"
-            params = (start_date, end_date)
-        query += " ORDER BY date DESC"
+    if st.button("🚀 Gerar Relatório"):
+        date_filter_sql = "" if all_time else f" WHERE date BETWEEN '{start_date}' AND '{end_date}'"
+        date_filter_sql_t = "" if all_time else f" WHERE t.date BETWEEN '{start_date}' AND '{end_date}'"
 
-        rows = run_query(query, params)
-        if not rows:
-            st.warning("Nenhum dado encontrado no período selecionado.")
-        else:
-            df_export = pd.DataFrame(rows)
-            # Reordenar colunas amigavelmente
-            cols_order = ['date', 'type', 'amount', 'category', 'description']
-            existing_cols = [c for c in cols_order if c in df_export.columns]
-            df_export = df_export[existing_cols]
+        # --- Aba 1: Transações ---
+        rows_trans = run_query(f"SELECT date, type, amount, category, description FROM transactions{date_filter_sql} ORDER BY date DESC")
+        df_trans = pd.DataFrame(rows_trans) if rows_trans else pd.DataFrame(columns=['date','type','amount','category','description'])
+        df_trans.columns = ['Data','Tipo','Valor (R$)','Categoria','Descrição']
 
-            if format_opt == "Excel (.xlsx)":
-                try:
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        df_export.to_excel(writer, index=False, sheet_name='Transacoes')
-                    processed_data = output.getvalue()
-                    st.download_button(
-                        label="📥 Clique aqui para baixar o Excel",
-                        data=processed_data,
-                        file_name=f"export_erpj_{date.today()}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    st.success("Arquivo Excel gerado com sucesso!")
-                except Exception as e:
-                    st.error(f"Erro ao gerar Excel: {e}")
+        # --- Aba 2: Lucro por Produto ---
+        q_produto = f"""
+        SELECT 
+            p.name AS Produto,
+            COUNT(m_out.id) AS Qtd_Vendida,
+            ROUND(SUM(m_out.quantity * t.amount / NULLIF(
+                (SELECT SUM(q2.quantity) FROM stock_movements q2 WHERE q2.product_id = p.id AND q2.movement_type='out'), 0
+            )), 2) AS Receita_Total,
+            ROUND(SUM(m_out.quantity * COALESCE(m_in_last.unit_cost, 0)), 2) AS CMV_Total,
+            ROUND(SUM(m_out.quantity * t.amount / NULLIF(
+                (SELECT SUM(q2.quantity) FROM stock_movements q2 WHERE q2.product_id = p.id AND q2.movement_type='out'), 0
+            )) - SUM(m_out.quantity * COALESCE(m_in_last.unit_cost, 0)), 2) AS Lucro_Bruto
+        FROM products p
+        JOIN stock_movements m_out ON m_out.product_id = p.id AND m_out.movement_type='out'
+        JOIN transactions t ON t.product_id = p.id AND t.type='Receita'
+        LEFT JOIN (
+            SELECT product_id, unit_cost FROM stock_movements
+            WHERE movement_type='in' AND id IN (
+                SELECT MAX(id) FROM stock_movements WHERE movement_type='in' GROUP BY product_id
+            )
+        ) m_in_last ON m_in_last.product_id = p.id
+        GROUP BY p.id, p.name
+        """
+        # Abordagem mais simples e portável por produto:
+        q_prod_simple = """
+        SELECT 
+            p.name AS Produto,
+            SUM(CASE WHEN m.movement_type='out' THEN m.quantity ELSE 0 END) AS Qtd_Vendida,
+            COALESCE((SELECT SUM(t2.amount) FROM transactions t2 WHERE t2.product_id=p.id AND t2.type='Receita'), 0) AS Receita_Total,
+            SUM(CASE WHEN m.movement_type='out' THEN m.quantity * COALESCE(m.unit_cost,0) ELSE 0 END) AS CMV_Total,
+            COALESCE((SELECT SUM(t2.amount) FROM transactions t2 WHERE t2.product_id=p.id AND t2.type='Receita'), 0) 
+            - SUM(CASE WHEN m.movement_type='out' THEN m.quantity * COALESCE(m.unit_cost,0) ELSE 0 END) AS Lucro_Bruto
+        FROM products p
+        LEFT JOIN stock_movements m ON m.product_id = p.id
+        GROUP BY p.id, p.name
+        """
+        rows_prod = run_query(q_prod_simple)
+        df_prod = pd.DataFrame(rows_prod) if rows_prod else pd.DataFrame(columns=['Produto','Qtd_Vendida','Receita_Total','CMV_Total','Lucro_Bruto'])
 
-            else: # PDF
-                try:
-                    from fpdf import FPDF
-                    pdf = FPDF()
+        # --- Aba 3: Sócios ---
+        rows_socios = run_query("""
+        SELECT 
+            p.name AS Socio,
+            p.share_pct AS Participacao_Pct,
+            COALESCE(c.total_aportado, 0) AS Total_Aportado,
+            COALESCE(w.total_retirado, 0) AS Total_Retirado
+        FROM partners p
+        LEFT JOIN (SELECT partner_id, SUM(amount) as total_aportado FROM contributions GROUP BY partner_id) c ON c.partner_id = p.id
+        LEFT JOIN (SELECT partner_id, SUM(amount) as total_retirado FROM withdrawals GROUP BY partner_id) w ON w.partner_id = p.id
+        """)
+        df_socios_base = pd.DataFrame(rows_socios) if rows_socios else pd.DataFrame()
+
+        # Detalhes de aportes e retiradas
+        rows_aportes = run_query("""
+        SELECT p.name AS Socio, 'Aporte' AS Tipo, c.amount AS Valor, c.date AS Data, c.note AS Nota
+        FROM contributions c JOIN partners p ON c.partner_id = p.id
+        UNION ALL
+        SELECT p.name AS Socio, 'Retirada' AS Tipo, w.amount AS Valor, w.date AS Data, w.reason AS Nota
+        FROM withdrawals w JOIN partners p ON w.partner_id = p.id
+        ORDER BY Data DESC
+        """)
+        df_mov_socios = pd.DataFrame(rows_aportes) if rows_aportes else pd.DataFrame(columns=['Socio','Tipo','Valor','Data','Nota'])
+
+        if format_opt == "Excel (.xlsx)":
+            try:
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    # Aba de Resumo
+                    kpi_data_exp = get_advanced_kpis('year')
+                    if kpi_data_exp:
+                        k = kpi_data_exp[0]
+                        df_resumo = pd.DataFrame([{
+                            'Faturamento (R$)': round(float(k.get('revenue',0)),2),
+                            'Despesas (R$)': round(float(k.get('expenses',0)),2),
+                            'CMV (R$)': round(float(k.get('cmv',0)),2),
+                            'Lucro Liquido (R$)': round(float(k.get('net_profit',0)),2),
+                            'Saldo em Caixa (R$)': round(float(k.get('total_cash',0)),2),
+                        }])
+                        df_resumo.to_excel(writer, index=False, sheet_name='Resumo')
+                    df_trans.to_excel(writer, index=False, sheet_name='Transacoes')
+                    df_prod.to_excel(writer, index=False, sheet_name='Lucro por Produto')
+                    if not df_socios_base.empty:
+                        df_socios_base.to_excel(writer, index=False, sheet_name='Socios - Resumo')
+                    if not df_mov_socios.empty:
+                        df_mov_socios.to_excel(writer, index=False, sheet_name='Socios - Movimentacoes')
+
+                processed_data = output.getvalue()
+                st.download_button(
+                    label="📥 Baixar Relatório Excel Completo",
+                    data=processed_data,
+                    file_name=f"relatorio_completo_{date.today()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                st.success("✅ Relatório Excel gerado com 5 abas: Resumo, Transações, Lucro por Produto, Sócios Resumo, Sócios Movimentações")
+            except Exception as e:
+                st.error(f"Erro ao gerar Excel: {e}")
+
+        else:  # PDF
+            try:
+                from fpdf import FPDF
+                pdf = FPDF()
+                pdf.set_auto_page_break(auto=True, margin=15)
+
+                def pdf_section_header(title):
                     pdf.add_page()
-                    pdf.set_font("Helvetica", 'B', 16)
-                    pdf.cell(0, 10, "Relatorio de Transacoes - ERP Inteligente", ln=True, align='C')
-                    pdf.set_font("Helvetica", size=10)
-                    pdf.ln(10)
-                    
-                    # Header
-                    pdf.set_fill_color(240, 240, 240)
-                    pdf.cell(25, 10, "Data", 1, 0, 'C', True)
-                    pdf.cell(20, 10, "Tipo", 1, 0, 'C', True)
-                    pdf.cell(30, 10, "Valor", 1, 0, 'C', True)
-                    pdf.cell(40, 10, "Categoria", 1, 0, 'C', True)
-                    pdf.cell(75, 10, "Descricao", 1, 1, 'C', True)
-                    
-                    # Rows
-                    for _, row in df_export.iterrows():
-                        pdf.cell(25, 8, str(row.get('date', '')), 1)
-                        pdf.cell(20, 8, str(row.get('type', '')), 1)
-                        amt = float(row.get('amount', 0))
-                        pdf.cell(30, 8, f"R$ {amt:.2f}", 1) 
-                        cat = str(row.get('category', ''))
-                        pdf.cell(40, 8, cat[:20], 1)
-                        desc = str(row.get('description', ''))
-                        pdf.cell(75, 8, desc[:40], 1, 1)
-                    
-                    # Para fpdf2, .output() sem argumentos retorna um bytearray
-                    pdf_bytes = bytes(pdf.output())
-                    st.download_button(
-                        label="📥 Clique aqui para baixar o PDF",
-                        data=pdf_bytes,
-                        file_name=f"export_erpj_{date.today()}.pdf",
-                        mime="application/pdf"
-                    )
-                    st.success("Arquivo PDF gerado com sucesso!")
-                except Exception as e:
-                    st.error(f"Erro ao gerar PDF: {e}")
+                    pdf.set_font("Helvetica", 'B', 14)
+                    pdf.set_fill_color(40, 40, 40)
+                    pdf.set_text_color(255, 255, 255)
+                    pdf.cell(0, 10, title, ln=True, fill=True, align='C')
+                    pdf.set_text_color(0, 0, 0)
+                    pdf.ln(4)
+
+                def pdf_table(df, col_widths):
+                    pdf.set_font("Helvetica", 'B', 8)
+                    pdf.set_fill_color(220, 220, 220)
+                    for col, w in zip(df.columns, col_widths):
+                        pdf.cell(w, 7, str(col)[:20], 1, 0, 'C', True)
+                    pdf.ln()
+                    pdf.set_font("Helvetica", size=8)
+                    for _, row in df.iterrows():
+                        for val, w in zip(row.values, col_widths):
+                            txt = f"R$ {float(val):.2f}" if isinstance(val, (int, float)) else str(val)[:22]
+                            pdf.cell(w, 6, txt, 1)
+                        pdf.ln()
+
+                # Capa
+                pdf.add_page()
+                pdf.set_font("Helvetica", 'B', 20)
+                pdf.ln(30)
+                pdf.cell(0, 10, "Relatorio Financeiro Completo", ln=True, align='C')
+                pdf.set_font("Helvetica", size=12)
+                pdf.cell(0, 8, f"Gerado em: {date.today()}", ln=True, align='C')
+                if not all_time:
+                    pdf.cell(0, 8, f"Periodo: {start_date} a {end_date}", ln=True, align='C')
+
+                # Resumo KPIs
+                kpi_data_exp = get_advanced_kpis('year')
+                if kpi_data_exp:
+                    k = kpi_data_exp[0]
+                    pdf_section_header("RESUMO FINANCEIRO (ANO ATUAL)")
+                    pdf.set_font("Helvetica", size=11)
+                    kpis = [
+                        ("Faturamento Total", k.get('revenue', 0)),
+                        ("Despesas Totais", k.get('expenses', 0)),
+                        ("CMV (Custo Mercadorias)", k.get('cmv', 0)),
+                        ("Lucro Liquido", k.get('net_profit', 0)),
+                        ("Saldo em Caixa", k.get('total_cash', 0)),
+                    ]
+                    for label, val in kpis:
+                        pdf.cell(100, 8, label + ":", 0)
+                        pdf.cell(50, 8, f"R$ {float(val):.2f}", 0, ln=True)
+
+                # Transações
+                if not df_trans.empty:
+                    pdf_section_header("TRANSACOES")
+                    pdf_table(df_trans, [25, 18, 25, 35, 87])
+
+                # Lucro por produto
+                if not df_prod.empty:
+                    pdf_section_header("LUCRO POR PRODUTO")
+                    pdf_table(df_prod, [55, 20, 32, 32, 32])
+
+                # Movimentações de sócios
+                if not df_mov_socios.empty:
+                    pdf_section_header("MOVIMENTACOES DE SOCIOS (Aportes e Retiradas)")
+                    pdf_table(df_mov_socios, [40, 22, 28, 25, 75])
+
+                pdf_bytes = bytes(pdf.output())
+                st.download_button(
+                    label="📥 Baixar Relatório PDF Completo",
+                    data=pdf_bytes,
+                    file_name=f"relatorio_completo_{date.today()}.pdf",
+                    mime="application/pdf"
+                )
+                st.success("✅ PDF completo gerado com todas as seções!")
+            except Exception as e:
+                st.error(f"Erro ao gerar PDF: {e}")
 
