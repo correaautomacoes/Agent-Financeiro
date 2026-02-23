@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import date
 import plotly.express as px
 import io
-from database import run_query, save_transactions_batch
+from database import run_query, save_transactions_batch, init_db
 from ai_agent import process_chat_command, generate_ai_reply, process_statement, set_api_key_permanent
 from db_helpers import (
     create_company, get_companies,
@@ -12,6 +12,7 @@ from db_helpers import (
     add_stock_movement, get_stock_level,
     get_expense_types, get_income_types,
     create_sale, create_contribution, create_withdrawal,
+    create_partner_loan, add_partner_loan_payment, get_partner_loans, get_partner_loans_summary,
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
     create_fixed_expense, get_inventory_report, get_revenue_details,
     delete_history_item, get_all_transactions, get_detailed_stock_report,
@@ -23,6 +24,11 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # ... (sidebar debug code) ...
+
+# Garante criação/migração de tabelas na primeira execução da sessão.
+if "db_initialized" not in st.session_state:
+    init_db()
+    st.session_state.db_initialized = True
 
 st.set_page_config(page_title="Agente Financeiro", page_icon="💰", layout="wide")
 
@@ -465,7 +471,12 @@ with tab2:
 
     with g2:
         st.subheader("Despesas por Categoria")
-        rows = run_query("SELECT category, SUM(amount) as total FROM transactions WHERE type='Despesa' GROUP BY category")
+        rows = run_query(
+            "SELECT category, SUM(amount) as total "
+            "FROM transactions "
+            "WHERE type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') "
+            "GROUP BY category"
+        )
         if rows:
             ddf = pd.DataFrame(rows)
             st.plotly_chart(px.pie(ddf, names='category', values='total', hole=0.4), use_container_width=True)
@@ -517,7 +528,11 @@ with tab2:
     
     # Gráficos (Mantendo os existentes com melhoria)
     g1, g2 = st.columns(2)
-    rows = run_query("SELECT * FROM transactions ORDER BY date DESC LIMIT 100")
+    rows = run_query(
+        "SELECT * FROM transactions "
+        "WHERE COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') "
+        "ORDER BY date DESC LIMIT 100"
+    )
     if rows:
         df = pd.DataFrame(rows)
         df['amount'] = df['amount'].astype(float)
@@ -581,7 +596,14 @@ with tab_history:
         default_date = date.today() - timedelta(days=90)
         date_filter = st.date_input("Filtrar por data inicial", value=default_date)
     with col_f2:
-        type_filter = st.selectbox("Filtrar por tipo", ["Todos", "Receita", "Despesa", "Estoque"])
+        type_filter = st.selectbox(
+            "Filtrar por tipo",
+            [
+                "Todos", "Receita", "Despesa", "Estoque",
+                "Aporte Sócio", "Retirada Sócio",
+                "Empréstimo Sócio->Empresa", "Empréstimo Empresa->Sócio", "Amortização Empréstimo"
+            ]
+        )
     
     # Busca dados
     all_trans = get_all_transactions(limit=300)
@@ -617,7 +639,7 @@ with tab_history:
                         st.success("Lançamento cancelado com sucesso!")
                         st.rerun()
                     else:
-                        st.error("Erro ao excluir lançamento.")
+                        st.error("Erro ao excluir lançamento. Se for empréstimo, verifique se não há amortizações vinculadas.")
 
             st.divider()
             st.subheader("📋 Lista Completa")
@@ -900,6 +922,86 @@ with tab4:
             else: st.error("Erro na operação.")
     else:
         st.info("Cadastre um sócio primeiro.")
+
+    st.divider()
+    st.subheader("🏦 Empréstimos Sócio <> Empresa")
+    if partners:
+        loan_partner_opts = {p['name']: p['id'] for p in partners}
+        col_l1, col_l2, col_l3 = st.columns(3)
+        loan_partner_name = col_l1.selectbox("Sócio (Empréstimo)", options=list(loan_partner_opts.keys()), key="loan_partner")
+        loan_direction_label = col_l2.selectbox(
+            "Direção do Empréstimo",
+            ["Sócio -> Empresa", "Empresa -> Sócio"],
+            key="loan_direction"
+        )
+        loan_amount = col_l3.number_input("Valor do Empréstimo (R$)", min_value=0.01, step=0.01, key="loan_amount")
+
+        col_ld1, col_ld2, col_ld3 = st.columns(3)
+        loan_date = col_ld1.date_input("Data do Empréstimo", value=date.today(), key="loan_date")
+        has_due = col_ld2.checkbox("Tem vencimento?", key="loan_has_due")
+        due_date = col_ld3.date_input("Data Vencimento", value=date.today(), key="loan_due_date", disabled=not has_due)
+
+        col_li1, col_li2 = st.columns(2)
+        loan_interest = col_li1.number_input("Juros (% ao mês, opcional)", min_value=0.0, step=0.1, key="loan_interest")
+        loan_note = col_li2.text_input("Observação do Empréstimo", key="loan_note", placeholder="Ex: Capital de giro")
+
+        if st.button("Registrar Empréstimo", key="btn_create_loan"):
+            direction_map = {"Sócio -> Empresa": "partner_to_company", "Empresa -> Sócio": "company_to_partner"}
+            loan_id = create_partner_loan(
+                partner_id=loan_partner_opts[loan_partner_name],
+                direction=direction_map[loan_direction_label],
+                amount=loan_amount,
+                loan_date=str(loan_date),
+                due_date=str(due_date) if has_due else None,
+                interest_rate=loan_interest,
+                note=loan_note
+            )
+            if loan_id:
+                st.success(f"Empréstimo registrado (id={loan_id}).")
+                st.rerun()
+            else:
+                st.error("Erro ao registrar empréstimo.")
+
+        st.markdown("**Amortização de Empréstimos**")
+        open_loans = get_partner_loans(status="open")
+        if open_loans:
+            loan_items = {f"#{l['id']} | {l.get('partner_name','-')} | {'Sócio->Empresa' if l['direction']=='partner_to_company' else 'Empresa->Sócio'} | Saldo R$ {float(l['outstanding_amount']):.2f}": l for l in open_loans}
+            selected_open_loan = st.selectbox("Selecione o empréstimo em aberto", options=list(loan_items.keys()), key="loan_payment_target")
+            pl1, pl2, pl3 = st.columns(3)
+            pay_amount = pl1.number_input("Valor da Amortização (R$)", min_value=0.01, step=0.01, key="loan_payment_amount")
+            pay_date = pl2.date_input("Data da Amortização", value=date.today(), key="loan_payment_date")
+            pay_note = pl3.text_input("Observação da Amortização", key="loan_payment_note")
+            if st.button("Registrar Amortização", key="btn_add_loan_payment"):
+                selected_loan = loan_items[selected_open_loan]
+                pay_id = add_partner_loan_payment(
+                    loan_id=int(selected_loan["id"]),
+                    amount=pay_amount,
+                    payment_date=str(pay_date),
+                    note=pay_note
+                )
+                if pay_id:
+                    st.success(f"Amortização registrada (id={pay_id}).")
+                    st.rerun()
+                else:
+                    st.error("Erro ao registrar amortização. Verifique valor e saldo em aberto.")
+        else:
+            st.info("Não há empréstimos em aberto para amortizar.")
+
+        summary = get_partner_loans_summary()
+        if summary:
+            st.markdown("**Saldos em Aberto por Sócio**")
+            sum_df = pd.DataFrame(summary)
+            sum_df.columns = ["ID Sócio", "Sócio", "Empresa Deve ao Sócio", "Sócio Deve à Empresa"]
+            st.dataframe(
+                sum_df.style.format({
+                    "Empresa Deve ao Sócio": "R$ {:.2f}",
+                    "Sócio Deve à Empresa": "R$ {:.2f}"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+    else:
+        st.info("Cadastre um sócio para registrar empréstimos.")
 
     st.divider()
     st.subheader("📅 Despesas Fixas / Programadas")

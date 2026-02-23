@@ -183,6 +183,29 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS partner_loans (
+        id {serial_type},
+        partner_id INTEGER REFERENCES partners(id) ON DELETE SET NULL,
+        direction VARCHAR(30) NOT NULL,
+        principal_amount DECIMAL(12,2) NOT NULL,
+        outstanding_amount DECIMAL(12,2) NOT NULL,
+        interest_rate DECIMAL(6,3) DEFAULT 0,
+        loan_date DATE DEFAULT CURRENT_DATE,
+        due_date DATE,
+        note TEXT,
+        status VARCHAR(20) DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS partner_loan_payments (
+        id {serial_type},
+        loan_id INTEGER REFERENCES partner_loans(id) ON DELETE CASCADE,
+        amount DECIMAL(12,2) NOT NULL,
+        payment_date DATE DEFAULT CURRENT_DATE,
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS fixed_expenses (
         id {serial_type},
         company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,

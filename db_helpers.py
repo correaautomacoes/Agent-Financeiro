@@ -3,6 +3,7 @@ import os
 from database import get_db_connection, run_query
 
 DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
+NON_OPERATIONAL_CATEGORIES = ("Empréstimo Sócios", "Amortização Empréstimo")
 
 
 def _safe_limit(limit: int, default: int = 300, maximum: int = 5000) -> int:
@@ -13,6 +14,20 @@ def _safe_limit(limit: int, default: int = 300, maximum: int = 5000) -> int:
         return min(value, maximum)
     except Exception:
         return default
+
+
+def _table_exists(table_name: str) -> bool:
+    try:
+        if DB_TYPE == "sqlite":
+            res = run_query("SELECT name FROM sqlite_master WHERE type='table' AND name = %s", (table_name,))
+        else:
+            res = run_query(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name = %s",
+                (table_name,)
+            )
+        return bool(res)
+    except Exception:
+        return False
 
 def create_company(name: str) -> Optional[int]:
     conn = get_db_connection()
@@ -252,6 +267,210 @@ def create_withdrawal(partner_id: int, amount: float, date: Optional[str] = None
             conn.close()
         return None
 
+
+def create_partner_loan(
+    partner_id: int,
+    direction: str,
+    amount: float,
+    loan_date: Optional[str] = None,
+    due_date: Optional[str] = None,
+    interest_rate: float = 0.0,
+    note: Optional[str] = None
+) -> Optional[int]:
+    """
+    Registra empréstimo entre sócio e empresa.
+    direction:
+      - partner_to_company: sócio empresta para empresa (entrada de caixa)
+      - company_to_partner: empresa empresta para sócio (saída de caixa)
+    """
+    if direction not in ("partner_to_company", "company_to_partner"):
+        return None
+    if not _table_exists("partner_loans") or not _table_exists("partner_loan_payments"):
+        return None
+
+    amount = float(amount or 0)
+    if amount <= 0:
+        return None
+
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        dt_val = loan_date if loan_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
+        dt_sql = ph if loan_date else dt_val
+        due_sql = ph
+
+        q = (
+            f"INSERT INTO partner_loans (partner_id, direction, principal_amount, outstanding_amount, interest_rate, loan_date, due_date, note, status) "
+            f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {dt_sql}, {due_sql}, {ph}, 'open')"
+        )
+        params = (
+            (partner_id, direction, amount, amount, float(interest_rate or 0), loan_date, due_date, note)
+            if loan_date
+            else (partner_id, direction, amount, amount, float(interest_rate or 0), due_date, note)
+        )
+
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            loan_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            loan_id = cur.lastrowid
+
+        t_type = "Receita" if direction == "partner_to_company" else "Despesa"
+        direction_label = "Sócio->Empresa" if direction == "partner_to_company" else "Empresa->Sócio"
+        dt_tx = dt_sql
+        tx_q = (
+            f"INSERT INTO transactions (type, amount, category, description, date, partner_id) "
+            f"VALUES ({ph}, {ph}, 'Empréstimo Sócios', {ph}, {dt_tx}, {ph})"
+        )
+        tx_desc = f"[LOAN:{loan_id}] Empréstimo {direction_label}. {note or ''}".strip()
+        tx_params = (t_type, amount, tx_desc, loan_date, partner_id) if loan_date else (t_type, amount, tx_desc, partner_id)
+        cur.execute(tx_q, tx_params)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return loan_id
+    except Exception as e:
+        print(f"Erro create_partner_loan: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        return None
+
+
+def add_partner_loan_payment(
+    loan_id: int,
+    amount: float,
+    payment_date: Optional[str] = None,
+    note: Optional[str] = None
+) -> Optional[int]:
+    if not _table_exists("partner_loans") or not _table_exists("partner_loan_payments"):
+        return None
+    amount = float(amount or 0)
+    if amount <= 0:
+        return None
+
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        loan_rows = run_query(
+            "SELECT id, partner_id, direction, outstanding_amount, status FROM partner_loans WHERE id = %s",
+            (loan_id,)
+        ) or []
+        if not loan_rows:
+            return None
+        loan = loan_rows[0]
+        if loan.get("status") != "open":
+            return None
+
+        outstanding = float(loan.get("outstanding_amount") or 0)
+        if amount > outstanding:
+            return None
+
+        dt_val = payment_date if payment_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
+        dt_sql = ph if payment_date else dt_val
+
+        q = f"INSERT INTO partner_loan_payments (loan_id, amount, payment_date, note) VALUES ({ph}, {ph}, {dt_sql}, {ph})"
+        params = (loan_id, amount, payment_date, note) if payment_date else (loan_id, amount, note)
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            payment_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            payment_id = cur.lastrowid
+
+        new_outstanding = max(outstanding - amount, 0.0)
+        new_status = "paid" if new_outstanding <= 0 else "open"
+        cur.execute(
+            f"UPDATE partner_loans SET outstanding_amount = {ph}, status = {ph} WHERE id = {ph}",
+            (new_outstanding, new_status, loan_id)
+        )
+
+        # Fluxo de caixa da amortização:
+        # partner_to_company -> empresa paga (Despesa)
+        # company_to_partner -> empresa recebe (Receita)
+        t_type = "Despesa" if loan.get("direction") == "partner_to_company" else "Receita"
+        tx_desc = f"[LOANPAY:{payment_id}|LOAN:{loan_id}] Amortização empréstimo. {note or ''}".strip()
+        tx_q = (
+            f"INSERT INTO transactions (type, amount, category, description, date, partner_id) "
+            f"VALUES ({ph}, {ph}, 'Amortização Empréstimo', {ph}, {dt_sql}, {ph})"
+        )
+        tx_params = (t_type, amount, tx_desc, payment_date, loan.get("partner_id")) if payment_date else (t_type, amount, tx_desc, loan.get("partner_id"))
+        cur.execute(tx_q, tx_params)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return payment_id
+    except Exception as e:
+        print(f"Erro add_partner_loan_payment: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        return None
+
+
+def get_partner_loans(partner_id: Optional[int] = None, status: Optional[str] = None):
+    if not _table_exists("partner_loans"):
+        return []
+    query = """
+    SELECT
+        l.id,
+        l.partner_id,
+        p.name AS partner_name,
+        l.direction,
+        l.principal_amount,
+        l.outstanding_amount,
+        l.interest_rate,
+        l.loan_date,
+        l.due_date,
+        l.note,
+        l.status,
+        l.created_at
+    FROM partner_loans l
+    LEFT JOIN partners p ON p.id = l.partner_id
+    WHERE 1=1
+    """
+    params = []
+    if partner_id:
+        query += " AND l.partner_id = %s"
+        params.append(partner_id)
+    if status:
+        query += " AND l.status = %s"
+        params.append(status)
+    query += " ORDER BY l.loan_date DESC, l.id DESC"
+    return run_query(query, tuple(params) if params else None) or []
+
+
+def get_partner_loans_summary():
+    if not _table_exists("partner_loans"):
+        return []
+    query = """
+    SELECT
+        p.id AS partner_id,
+        p.name AS partner_name,
+        COALESCE(SUM(CASE WHEN l.direction='partner_to_company' AND l.status='open' THEN l.outstanding_amount ELSE 0 END), 0) AS company_owes_partner,
+        COALESCE(SUM(CASE WHEN l.direction='company_to_partner' AND l.status='open' THEN l.outstanding_amount ELSE 0 END), 0) AS partner_owes_company
+    FROM partners p
+    LEFT JOIN partner_loans l ON l.partner_id = p.id
+    GROUP BY p.id, p.name
+    ORDER BY p.name
+    """
+    return run_query(query) or []
+
 def create_fixed_expense(company_id: int, name: str, amount: float, due_day: int):
     ph = "?" if DB_TYPE == "sqlite" else "%s"
     return run_query(f"INSERT INTO fixed_expenses (company_id, name, amount, due_day) VALUES ({ph}, {ph}, {ph}, {ph})", (company_id, name, amount, due_day))
@@ -260,8 +479,8 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
     query = """
     SELECT 
         p.id, p.name, p.share_pct,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita') AS total_revenue,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa') AS total_expenses,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo')) AS total_revenue,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo')) AS total_expenses,
         (SELECT COALESCE(SUM(c.amount), 0) FROM contributions c WHERE c.partner_id = p.id) AS total_contributed,
         (SELECT COALESCE(SUM(w.amount), 0) FROM withdrawals w WHERE w.partner_id = p.id) AS total_withdrawn
     FROM partners p
@@ -300,8 +519,8 @@ def get_advanced_kpis(period: str = 'month'):
     
     # Receita e despesas do período
     q_period = f"""SELECT 
-        COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE 0 END), 0) AS revenue,
-        COALESCE(SUM(CASE WHEN type='Despesa' THEN amount ELSE 0 END), 0) AS expenses
+        COALESCE(SUM(CASE WHEN type='Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') THEN amount ELSE 0 END), 0) AS revenue,
+        COALESCE(SUM(CASE WHEN type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') THEN amount ELSE 0 END), 0) AS expenses
     FROM transactions WHERE {filter_sql}"""
     
     # Saldo total do caixa: todas as receitas - todas as despesas + aportes de sócios - retiradas de sócios
@@ -362,7 +581,12 @@ def get_inventory_report():
     return res
 
 def get_revenue_details():
-    res = run_query("SELECT CASE WHEN product_id IS NOT NULL THEN 'Venda' ELSE 'Servico' END as channel, SUM(amount) as total FROM transactions WHERE type = 'Receita' GROUP BY channel") or []
+    res = run_query(
+        "SELECT CASE WHEN product_id IS NOT NULL THEN 'Venda' ELSE 'Servico' END as channel, SUM(amount) as total "
+        "FROM transactions "
+        "WHERE type = 'Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') "
+        "GROUP BY channel"
+    ) or []
     return res
 
 def get_expense_types(company_id=None):
@@ -402,6 +626,54 @@ def delete_history_item(source: str, record_id: int) -> bool:
     - source='transaction': remove transação; se for venda, remove também 1 saída de estoque correlata.
     - source='stock': remove movimentação de estoque diretamente.
     """
+    if source == "contribution":
+        res = run_query("DELETE FROM contributions WHERE id = %s", (record_id,))
+        return res is True
+
+    if source == "withdrawal":
+        res = run_query("DELETE FROM withdrawals WHERE id = %s", (record_id,))
+        return res is True
+
+    if source == "loan":
+        if not _table_exists("partner_loans") or not _table_exists("partner_loan_payments"):
+            return False
+        # Não permite cancelar empréstimo com amortizações já registradas.
+        has_payments = run_query("SELECT id FROM partner_loan_payments WHERE loan_id = %s LIMIT 1", (record_id,)) or []
+        if has_payments:
+            return False
+
+        # Remove transação financeira vinculada ao registro de empréstimo.
+        run_query(
+            "DELETE FROM transactions WHERE category = 'Empréstimo Sócios' AND description LIKE %s",
+            (f"[LOAN:{record_id}]%",)
+        )
+        res = run_query("DELETE FROM partner_loans WHERE id = %s", (record_id,))
+        return res is True
+
+    if source == "loan_payment":
+        if not _table_exists("partner_loans") or not _table_exists("partner_loan_payments"):
+            return False
+        pay_rows = run_query(
+            "SELECT id, loan_id, amount FROM partner_loan_payments WHERE id = %s",
+            (record_id,)
+        ) or []
+        if not pay_rows:
+            return False
+        pay = pay_rows[0]
+
+        # Reverte saldo do empréstimo.
+        run_query(
+            "UPDATE partner_loans SET outstanding_amount = outstanding_amount + %s, status = 'open' WHERE id = %s",
+            (pay["amount"], pay["loan_id"])
+        )
+        # Remove transação financeira vinculada à amortização.
+        run_query(
+            "DELETE FROM transactions WHERE category = 'Amortização Empréstimo' AND description LIKE %s",
+            (f"[LOANPAY:{record_id}|LOAN:{pay['loan_id']}]%",)
+        )
+        res = run_query("DELETE FROM partner_loan_payments WHERE id = %s", (record_id,))
+        return res is True
+
     if source == "stock":
         mv_rows = run_query(
             "SELECT id, product_id, movement_type, reference FROM stock_movements WHERE id = %s",
@@ -457,34 +729,98 @@ def delete_history_item(source: str, record_id: int) -> bool:
 
 def get_all_transactions(limit: int = 300) -> List[Dict[str, Any]]:
     """Busca o histórico unificado (financeiro e estoque), garantindo visibilidade total."""
-    # SQLite usa date('now'), Postgres usa CURRENT_DATE. Usamos coalesce e formatos compatíveis.
-    # Usamos LEFT JOIN para garantir que movimentos de estoque sem produto (ou com produto deletado) apareçam.
     safe_limit = _safe_limit(limit)
-    query = f"""
-    SELECT
-        id,
-        CAST(date AS TEXT) as date,
-        type,
-        amount,
-        category,
-        description,
-        'transaction' as source,
-        id as source_id
-    FROM transactions
-    UNION ALL
-    SELECT
-        m.id,
-        CAST(date(m.created_at) AS TEXT) as date,
-        'Estoque' as type,
-        (COALESCE(m.unit_cost, 0) * m.quantity) as amount,
-        m.movement_type as category,
-        COALESCE(p.name, 'Produto Removido') || ' (' || COALESCE(m.reference, '') || ')' as description,
-        'stock' as source,
-        m.id as source_id
-    FROM stock_movements m
-    LEFT JOIN products p ON m.product_id = p.id
-    ORDER BY date DESC, id DESC LIMIT {safe_limit}
-    """
+    parts = [
+        """
+        SELECT
+            id,
+            CAST(date AS TEXT) as date,
+            type,
+            amount,
+            category,
+            description,
+            'transaction' as source,
+            id as source_id
+        FROM transactions
+        WHERE COALESCE(category, '') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo')
+        """,
+        """
+        SELECT
+            c.id,
+            CAST(c.date AS TEXT) as date,
+            'Aporte Sócio' as type,
+            c.amount as amount,
+            'Aporte' as category,
+            COALESCE(p.name, 'Sócio Removido') || ' (' || COALESCE(c.note, '') || ')' as description,
+            'contribution' as source,
+            c.id as source_id
+        FROM contributions c
+        LEFT JOIN partners p ON c.partner_id = p.id
+        """,
+        """
+        SELECT
+            w.id,
+            CAST(w.date AS TEXT) as date,
+            'Retirada Sócio' as type,
+            w.amount as amount,
+            'Retirada' as category,
+            COALESCE(p.name, 'Sócio Removido') || ' (' || COALESCE(w.reason, '') || ')' as description,
+            'withdrawal' as source,
+            w.id as source_id
+        FROM withdrawals w
+        LEFT JOIN partners p ON w.partner_id = p.id
+        """,
+        """
+        SELECT
+            m.id,
+            CAST(date(m.created_at) AS TEXT) as date,
+            'Estoque' as type,
+            (COALESCE(m.unit_cost, 0) * m.quantity) as amount,
+            m.movement_type as category,
+            COALESCE(p.name, 'Produto Removido') || ' (' || COALESCE(m.reference, '') || ')' as description,
+            'stock' as source,
+            m.id as source_id
+        FROM stock_movements m
+        LEFT JOIN products p ON m.product_id = p.id
+        """
+    ]
+
+    if _table_exists("partner_loans"):
+        parts.append(
+            """
+            SELECT
+                l.id,
+                CAST(l.loan_date AS TEXT) as date,
+                CASE WHEN l.direction='partner_to_company' THEN 'Empréstimo Sócio->Empresa' ELSE 'Empréstimo Empresa->Sócio' END as type,
+                l.principal_amount as amount,
+                'Empréstimo Sócios' as category,
+                COALESCE(p.name, 'Sócio Removido') || ' (' || COALESCE(l.note, '') || ')' as description,
+                'loan' as source,
+                l.id as source_id
+            FROM partner_loans l
+            LEFT JOIN partners p ON l.partner_id = p.id
+            """
+        )
+
+    if _table_exists("partner_loan_payments") and _table_exists("partner_loans"):
+        parts.append(
+            """
+            SELECT
+                pay.id,
+                CAST(pay.payment_date AS TEXT) as date,
+                'Amortização Empréstimo' as type,
+                pay.amount as amount,
+                'Amortização Empréstimo' as category,
+                COALESCE(p.name, 'Sócio Removido') || ' (' || COALESCE(pay.note, '') || ')' as description,
+                'loan_payment' as source,
+                pay.id as source_id
+            FROM partner_loan_payments pay
+            LEFT JOIN partner_loans l ON l.id = pay.loan_id
+            LEFT JOIN partners p ON l.partner_id = p.id
+            """
+        )
+
+    query = " UNION ALL ".join(parts) + f" ORDER BY date DESC, id DESC LIMIT {safe_limit}"
     return run_query(query) or []
 
 def get_detailed_stock_report() -> List[Dict[str, Any]]:
