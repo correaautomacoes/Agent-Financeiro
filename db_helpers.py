@@ -3,7 +3,7 @@ import os
 from database import get_db_connection, run_query
 
 DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
-NON_OPERATIONAL_CATEGORIES = ("Empréstimo Sócios", "Amortização Empréstimo")
+NON_OPERATIONAL_CATEGORIES = ("Empréstimo Sócios", "Amortização Empréstimo", "Estoque/Compra")
 
 
 def _safe_limit(limit: int, default: int = 300, maximum: int = 5000) -> int:
@@ -28,6 +28,16 @@ def _table_exists(table_name: str) -> bool:
         return bool(res)
     except Exception:
         return False
+
+
+def _get_latest_in_unit_cost(product_id: int) -> float:
+    rows = run_query(
+        "SELECT unit_cost FROM stock_movements WHERE product_id = %s AND movement_type='in' AND unit_cost > 0 ORDER BY id DESC LIMIT 1",
+        (product_id,)
+    ) or []
+    if not rows:
+        return 0.0
+    return float(rows[0].get("unit_cost") or 0.0)
 
 def create_company(name: str) -> Optional[int]:
     conn = get_db_connection()
@@ -134,6 +144,8 @@ def add_stock_movement(product_id: int, quantity: int, movement_type: str, refer
             avail = get_stock_level(product_id)
             if avail < qty:
                 raise Exception(f"Estoque insuficiente ({avail})")
+            if float(unit_cost or 0) <= 0:
+                unit_cost = _get_latest_in_unit_cost(product_id)
 
         ph = "?" if DB_TYPE == "sqlite" else "%s"
         query = f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, source, is_paid, unit_cost) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
@@ -183,8 +195,12 @@ def create_sale(
         if avail < quantity:
             raise Exception(f"Estoque insuficiente ({avail})")
         
+        out_unit_cost = _get_latest_in_unit_cost(product_id)
         ph = "?" if DB_TYPE == "sqlite" else "%s"
-        cur.execute(f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference) VALUES ({ph}, {ph}, 'out', {ph})", (product_id, quantity, description))
+        cur.execute(
+            f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, unit_cost) VALUES ({ph}, {ph}, 'out', {ph}, {ph})",
+            (product_id, quantity, description, out_unit_cost)
+        )
         
         total = float(unit_price) * int(quantity)
         dt_val = sale_date if sale_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
@@ -479,8 +495,8 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
     query = """
     SELECT 
         p.id, p.name, p.share_pct,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo')) AS total_revenue,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo')) AS total_expenses,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra')) AS total_revenue,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra')) AS total_expenses,
         (SELECT COALESCE(SUM(c.amount), 0) FROM contributions c WHERE c.partner_id = p.id) AS total_contributed,
         (SELECT COALESCE(SUM(w.amount), 0) FROM withdrawals w WHERE w.partner_id = p.id) AS total_withdrawn
     FROM partners p
@@ -519,8 +535,8 @@ def get_advanced_kpis(period: str = 'month'):
     
     # Receita e despesas do período
     q_period = f"""SELECT 
-        COALESCE(SUM(CASE WHEN type='Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') THEN amount ELSE 0 END), 0) AS revenue,
-        COALESCE(SUM(CASE WHEN type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') THEN amount ELSE 0 END), 0) AS expenses
+        COALESCE(SUM(CASE WHEN type='Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') THEN amount ELSE 0 END), 0) AS revenue,
+        COALESCE(SUM(CASE WHEN type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') THEN amount ELSE 0 END), 0) AS expenses
     FROM transactions WHERE {filter_sql}"""
     
     # Saldo total do caixa: todas as receitas - todas as despesas + aportes de sócios - retiradas de sócios
@@ -584,7 +600,7 @@ def get_revenue_details():
     res = run_query(
         "SELECT CASE WHEN product_id IS NOT NULL THEN 'Venda' ELSE 'Servico' END as channel, SUM(amount) as total "
         "FROM transactions "
-        "WHERE type = 'Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') "
+        "WHERE type = 'Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') "
         "GROUP BY channel"
     ) or []
     return res

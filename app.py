@@ -474,7 +474,7 @@ with tab2:
         rows = run_query(
             "SELECT category, SUM(amount) as total "
             "FROM transactions "
-            "WHERE type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') "
+            "WHERE type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') "
             "GROUP BY category"
         )
         if rows:
@@ -530,7 +530,7 @@ with tab2:
     g1, g2 = st.columns(2)
     rows = run_query(
         "SELECT * FROM transactions "
-        "WHERE COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo') "
+        "WHERE COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') "
         "ORDER BY date DESC LIMIT 100"
     )
     if rows:

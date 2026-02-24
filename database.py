@@ -247,6 +247,26 @@ def init_db():
             run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS unit_cost DECIMAL(12,2) DEFAULT 0")
     except: pass
 
+    # Backfill: preenche custo em saídas antigas sem unit_cost para habilitar CMV correto.
+    try:
+        run_query("""
+            UPDATE stock_movements AS m
+            SET unit_cost = COALESCE((
+                SELECT mi.unit_cost
+                FROM stock_movements mi
+                WHERE mi.product_id = m.product_id
+                  AND mi.movement_type = 'in'
+                  AND mi.unit_cost > 0
+                  AND mi.id <= m.id
+                ORDER BY mi.id DESC
+                LIMIT 1
+            ), 0)
+            WHERE m.movement_type = 'out'
+              AND COALESCE(m.unit_cost, 0) = 0
+        """)
+    except Exception as e:
+        print(f"Aviso ao preencher custos de saída: {e}")
+
     print(f"Banco de dados ({DB_TYPE}) inicializado com sucesso!")
 
 if __name__ == "__main__":
