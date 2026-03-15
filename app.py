@@ -15,6 +15,7 @@ from db_helpers import (
     create_partner_loan, add_partner_loan_payment, get_partner_loans, get_partner_loans_summary,
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
     create_fixed_expense, get_inventory_report, get_revenue_details, get_infra_inventory,
+    estimate_sale_cost,
     delete_history_item, get_all_transactions, get_detailed_stock_report,
     get_categories, create_category
 )
@@ -246,19 +247,21 @@ with tab_manual:
                     help="Pode alterar o preço para esta venda específica."
                 )
                 
-                # Preview do lucro
-                ultimo_custo_res = run_query(
-                    "SELECT unit_cost FROM stock_movements WHERE product_id = %s AND movement_type='in' AND unit_cost > 0 ORDER BY id DESC LIMIT 1",
-                    (p_id,)
-                )
-                ultimo_custo = float(ultimo_custo_res[0]['unit_cost']) if ultimo_custo_res else 0.0
+                # Preview do lucro já considerando custos adicionais vinculados ao produto.
+                custo_estimado = estimate_sale_cost(p_id, qty_venda)
+                ultimo_custo = float(custo_estimado.get('estimated_unit_cost') or 0.0)
                 total_venda = preco_venda * qty_venda
-                lucro_bruto = (preco_venda - ultimo_custo) * qty_venda
+                lucro_bruto = total_venda - float(custo_estimado.get('estimated_total_cost') or 0.0)
                 
                 col_i1, col_i2 = st.columns(2)
                 col_i1.info(f"💰 **Total da Venda:** R$ {total_venda:.2f}")
                 if ultimo_custo > 0:
                     col_i2.success(f"📈 **Lucro desta venda:** R$ {lucro_bruto:.2f}")
+                    if float(custo_estimado.get('extra_cost_total') or 0.0) > 0:
+                        st.caption(
+                            f"Custo estimado desta venda: R$ {float(custo_estimado.get('estimated_total_cost') or 0.0):.2f} "
+                            f"(inclui R$ {float(custo_estimado.get('extra_cost_total') or 0.0):.2f} de despesas vinculadas)."
+                        )
                 
                 col_d1, col_d2 = st.columns(2)
                 data_venda = col_d1.date_input("Data da Venda", value=date.today(), key="v_data")

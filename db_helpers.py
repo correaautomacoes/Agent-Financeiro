@@ -53,6 +53,54 @@ def _get_latest_in_unit_cost(product_id: int) -> float:
         return 0.0
     return float(rows[0].get("unit_cost") or 0.0)
 
+
+def _get_pending_cost_adjustments(product_id: int):
+    if not _table_exists("product_cost_adjustments"):
+        return []
+    rows = run_query(
+        "SELECT id, unit_increment, remaining_qty FROM product_cost_adjustments WHERE product_id = %s AND remaining_qty > 0 ORDER BY id ASC",
+        (product_id,)
+    ) or []
+    return rows
+
+
+def estimate_sale_cost(product_id: int, quantity: int = 1) -> Dict[str, float]:
+    qty = max(int(quantity or 0), 0)
+    if qty <= 0:
+        return {
+            "base_unit_cost": 0.0,
+            "extra_cost_total": 0.0,
+            "estimated_total_cost": 0.0,
+            "estimated_unit_cost": 0.0,
+            "pending_adjustment_total": 0.0,
+        }
+
+    base_unit_cost = _get_latest_in_unit_cost(product_id)
+    extra_cost_total = 0.0
+
+    for adj in _get_pending_cost_adjustments(product_id):
+        unit_inc = float(adj.get("unit_increment") or 0.0)
+        rem_qty = int(adj.get("remaining_qty") or 0)
+        if unit_inc <= 0 or rem_qty <= 0:
+            continue
+        alloc_qty = min(qty, rem_qty)
+        extra_cost_total += alloc_qty * unit_inc
+
+    estimated_total_cost = (base_unit_cost * qty) + extra_cost_total
+    estimated_unit_cost = estimated_total_cost / qty if qty > 0 else 0.0
+    pending_adjustment_total = sum(
+        float(adj.get("unit_increment") or 0.0) * int(adj.get("remaining_qty") or 0)
+        for adj in _get_pending_cost_adjustments(product_id)
+    )
+
+    return {
+        "base_unit_cost": base_unit_cost,
+        "extra_cost_total": extra_cost_total,
+        "estimated_total_cost": estimated_total_cost,
+        "estimated_unit_cost": estimated_unit_cost,
+        "pending_adjustment_total": pending_adjustment_total,
+    }
+
 def create_company(name: str) -> Optional[int]:
     conn = get_db_connection()
     if not conn:
@@ -277,36 +325,26 @@ def create_sale(
         if avail < qty_sold:
             raise Exception(f"Estoque insuficiente ({avail})")
         
-        out_unit_cost = _get_latest_in_unit_cost(product_id)
-        extra_cost_total = 0.0
+        estimate = estimate_sale_cost(product_id, qty_sold)
+        blended_unit_cost = float(estimate["estimated_unit_cost"])
 
         # Consome custos adicionais pendentes para aumentar CMV das saídas.
         if _table_exists("product_cost_adjustments"):
             ph = "?" if DB_TYPE == "sqlite" else "%s"
-            cur.execute(
-                f"SELECT id, unit_increment, remaining_qty FROM product_cost_adjustments WHERE product_id = {ph} AND remaining_qty > 0 ORDER BY id ASC",
-                (product_id,)
-            )
-            adjustments = cur.fetchall() or []
-            qty_left = qty_sold
+            adjustments = _get_pending_cost_adjustments(product_id)
             for adj in adjustments:
-                adj_id = adj[0]
-                unit_inc = float(adj[1] or 0)
-                rem_qty = int(adj[2] or 0)
-                if qty_left <= 0:
-                    break
+                adj_id = int(adj["id"])
+                rem_qty = int(adj["remaining_qty"] or 0)
+                unit_inc = float(adj["unit_increment"] or 0)
                 if rem_qty <= 0 or unit_inc <= 0:
                     continue
-                alloc_qty = min(qty_left, rem_qty)
-                extra_cost_total += alloc_qty * unit_inc
+                alloc_qty = min(qty_sold, rem_qty)
                 new_rem = rem_qty - alloc_qty
                 cur.execute(
                     f"UPDATE product_cost_adjustments SET remaining_qty = {ph} WHERE id = {ph}",
                     (new_rem, adj_id)
                 )
-                qty_left -= alloc_qty
 
-        blended_unit_cost = out_unit_cost + (extra_cost_total / qty_sold if qty_sold > 0 else 0.0)
         ph = "?" if DB_TYPE == "sqlite" else "%s"
         cur.execute(
             f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, unit_cost) VALUES ({ph}, {ph}, 'out', {ph}, {ph})",
@@ -712,10 +750,14 @@ def get_inventory_report():
     res = run_query(query) or []
     for r in res:
         qty = max(int(r['stock_qty']), 0)
-        last_cost = float(r['last_cost'] or 0)
+        estimate = estimate_sale_cost(int(r['id']), 1)
+        pending_total = float(estimate['pending_adjustment_total'])
+        base_cost = float(r['last_cost'] or 0)
+        effective_unit_cost = float(estimate['estimated_unit_cost'] or base_cost)
         price = float(r['price'] or 0)
         # Para indicadores de estoque, só conta o que está disponível hoje.
-        r['total_cost_value'] = last_cost * qty
+        r['last_cost'] = effective_unit_cost
+        r['total_cost_value'] = (base_cost * qty) + pending_total
         r['total_sale_value'] = price * qty
         r['stock_qty'] = qty
     return res
@@ -1033,7 +1075,12 @@ def get_detailed_stock_report() -> List[Dict[str, Any]]:
     """
     res = run_query(query) or []
     for r in res:
-        r['stock_value_cost'] = float(r['last_cost']) * int(r['current_stock'])
+        qty = max(int(r['current_stock'] or 0), 0)
+        estimate = estimate_sale_cost(int(r['id']), 1)
+        pending_total = float(estimate['pending_adjustment_total'])
+        base_cost = float(r['last_cost'] or 0)
+        r['last_cost'] = float(estimate['estimated_unit_cost'] or base_cost)
+        r['stock_value_cost'] = (base_cost * qty) + pending_total
         r['stock_value_sale'] = float(r['price']) * int(r['current_stock'])
     return res
 
