@@ -1,13 +1,19 @@
 @echo off
 cd /d "%~dp0"
+setlocal
 
 echo ==================================================
 echo    INICIANDO AGENTE FINANCEIRO
 echo ==================================================
 
-if not exist "venv\Scripts\activate.bat" (
-    echo [ERRO] Ambiente venv nao encontrado.
-    echo Rode o arquivo 'instalar_windows.bat' primeiro.
+set "STREAMLIT_BROWSER_GATHER_USAGE_STATS=false"
+set "USERPROFILE=%cd%"
+set "HOME=%cd%"
+
+python --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERRO] Python nao encontrado neste computador.
+    echo Instale o Python 3 e tente novamente.
     pause
     exit /b
 )
@@ -20,8 +26,7 @@ if %errorlevel% equ 0 (
 )
 
 echo [2/2] Abrindo Streamlit...
-call venv\Scripts\activate.bat
-streamlit run app.py
+echo.| python -m streamlit run app.py
 if %errorlevel% neq 0 (
     echo [ERRO] Falha ao iniciar o Streamlit.
     pause

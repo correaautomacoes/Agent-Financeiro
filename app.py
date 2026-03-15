@@ -11,10 +11,10 @@ from db_helpers import (
     create_product, get_products,
     add_stock_movement, get_stock_level,
     get_expense_types, get_income_types,
-    create_sale, create_contribution, create_withdrawal,
+    create_sale, create_contribution, create_withdrawal, create_product_cost_adjustment,
     create_partner_loan, add_partner_loan_payment, get_partner_loans, get_partner_loans_summary,
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
-    create_fixed_expense, get_inventory_report, get_revenue_details,
+    create_fixed_expense, get_inventory_report, get_revenue_details, get_infra_inventory,
     delete_history_item, get_all_transactions, get_detailed_stock_report,
     get_categories, create_category
 )
@@ -276,6 +276,25 @@ with tab_manual:
         st.subheader("Nova Receita ou Despesa")
         tipo_f = st.radio("Tipo", ["Receita", "Despesa"], horizontal=True)
         valor_f = st.number_input("Valor (R$)", min_value=0.01, step=0.01)
+
+        # Atalho para custo adicional de produto (impacta CMV futuro)
+        prods_fin = get_products()
+        vincular_produto = st.checkbox(
+            "Vincular despesa a um produto (Custo adicional / CMV)",
+            key="fin_link_product",
+            disabled=(tipo_f != "Despesa"),
+            help="Use para reparo, componente, frete, etc. Este valor será absorvido no CMV das próximas vendas do produto."
+        )
+        prod_fin_label = "-"
+        if vincular_produto and tipo_f == "Despesa":
+            if prods_fin:
+                prod_fin_label = st.selectbox(
+                    "Produto do custo",
+                    options=["-"] + [f"{p['id']} - {p['name']}" for p in prods_fin],
+                    key="fin_product_target"
+                )
+            else:
+                st.warning("Nenhum produto cadastrado para vincular custo.")
         
         # Dropdown dinâmico de categorias
         cats_disponiveis = get_categories(tipo_f)
@@ -297,6 +316,25 @@ with tab_manual:
             if not cat_f or cat_f == "➕ Criar nova categoria...":
                 st.warning("Por favor, informe o nome da nova categoria antes de salvar.")
             else:
+                if vincular_produto and tipo_f == "Despesa":
+                    if prod_fin_label == "-":
+                        st.warning("Selecione o produto para vincular o custo adicional.")
+                    else:
+                        target_pid = int(prod_fin_label.split(" - ")[0])
+                        adj_id = create_product_cost_adjustment(
+                            product_id=target_pid,
+                            amount=valor_f,
+                            date=str(data_f),
+                            note=desc_f,
+                            is_paid=True
+                        )
+                        if adj_id:
+                            st.success("Despesa vinculada ao produto e registrada como custo adicional de estoque (CMV).")
+                            st.rerun()
+                        else:
+                            st.error("Não foi possível registrar custo adicional. Verifique se o produto tem estoque disponível.")
+                    st.stop()
+
                 # Cria a categoria se for nova
                 if opcao_cat == "➕ Criar nova categoria...":
                     companies = get_companies()
@@ -428,26 +466,36 @@ with tab2:
     # Dados de Estoque e Receitas Detalhadas
     inv_data = get_inventory_report()
     rev_details = get_revenue_details()
+    infra_inventory = get_infra_inventory()
     # Mostramos o valor de VENDA total no dashboard (é o potencial de receita parada)
     total_inv_sale = sum([item.get('total_sale_value', 0) for item in inv_data]) if inv_data else 0
 
     # KPIs Principais
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
     if kpi_data:
         k = kpi_data[0]
-        c1.metric("📈 Faturamento", f"R$ {float(k.get('revenue', 0)):.2f}")
-        c2.metric("📉 Despesas", f"R$ {float(k.get('expenses', 0)):.2f}", delta_color="inverse")
-        c3.metric("🏷️ CMV (Custo Vendas)", f"R$ {float(k.get('cmv', 0)):.2f}", delta_color="inverse")
-        c4.metric("💡 Lucro Líquido", f"R$ {float(k.get('net_profit', 0)):.2f}")
-        c5.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
-        c6.metric("💰 Saldo em Caixa", f"R$ {float(k.get('total_cash', 0)):.2f}")
+        top_1, top_2, top_3, top_4 = st.columns(4)
+        top_1.metric("📈 Faturamento", f"R$ {float(k.get('revenue', 0)):.2f}")
+        top_2.metric("📉 Desp. Operacionais", f"R$ {float(k.get('expenses', 0)):.2f}", delta_color="inverse")
+        top_3.metric("🏷️ CMV", f"R$ {float(k.get('cmv', 0)):.2f}", delta_color="inverse")
+        top_4.metric("💡 Lucro Operacional", f"R$ {float(k.get('net_profit', 0)):.2f}")
+
+        bottom_1, bottom_2, bottom_3 = st.columns(3)
+        bottom_1.metric("🏗️ Invest. em Infra", f"R$ {float(k.get('infra_investment', 0)):.2f}", delta_color="inverse")
+        bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
+        bottom_3.metric("💰 Saldo em Caixa", f"R$ {float(k.get('total_cash', 0)):.2f}")
     else:
-        c1.metric("📈 Faturamento", "R$ 0.00")
-        c2.metric("📉 Despesas", "R$ 0.00")
-        c3.metric("🏷️ CMV (Custo Vendas)", "R$ 0.00")
-        c4.metric("💡 Lucro Líquido", "R$ 0.00")
-        c5.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
-        c6.metric("💰 Saldo em Caixa", "R$ 0.00")
+        top_1, top_2, top_3, top_4 = st.columns(4)
+        top_1.metric("📈 Faturamento", "R$ 0.00")
+        top_2.metric("📉 Desp. Operacionais", "R$ 0.00")
+        top_3.metric("🏷️ CMV", "R$ 0.00")
+        top_4.metric("💡 Lucro Operacional", "R$ 0.00")
+
+        bottom_1, bottom_2, bottom_3 = st.columns(3)
+        bottom_1.metric("🏗️ Invest. em Infra", "R$ 0.00")
+        bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
+        bottom_3.metric("💰 Saldo em Caixa", "R$ 0.00")
+
+    st.caption("Infraestrutura e Software/Infra passam a ser mostrados como investimento: afetam o caixa, mas não reduzem o lucro operacional.")
 
     # Alertas
     alerts = get_upcoming_alerts()
@@ -474,7 +522,7 @@ with tab2:
         rows = run_query(
             "SELECT category, SUM(amount) as total "
             "FROM transactions "
-            "WHERE type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') "
+            "WHERE type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra', 'Estoque/Custo Adicional', 'Infraestrutura', 'Software/Infra') "
             "GROUP BY category"
         )
         if rows:
@@ -525,12 +573,38 @@ with tab2:
             st.info("Cadastre sócios na aba 'Gerenciar'.")
 
     st.divider()
+
+    st.subheader("🏗️ Inventário de Infraestrutura")
+    if infra_inventory:
+        infra_df = pd.DataFrame(infra_inventory)
+        total_infra = float(infra_df['total_invested'].astype(float).sum())
+        infra_items = int(len(infra_df.index))
+        infra_entries = int(infra_df['entries'].astype(int).sum())
+
+        i1, i2, i3 = st.columns(3)
+        i1.metric("Itens de Infra", infra_items)
+        i2.metric("Lançamentos de Infra", infra_entries)
+        i3.metric("Total Investido", f"R$ {total_infra:.2f}")
+
+        display_infra = infra_df[['item_name', 'category', 'entries', 'last_date', 'total_invested']].copy()
+        display_infra.columns = ['Item', 'Categoria', 'Lançamentos', 'Última Data', 'Total Investido']
+        st.dataframe(
+            display_infra.style.format({
+                'Total Investido': 'R$ {:.2f}'
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Nenhum investimento em infraestrutura encontrado até agora.")
+
+    st.divider()
     
     # Gráficos (Mantendo os existentes com melhoria)
     g1, g2 = st.columns(2)
     rows = run_query(
         "SELECT * FROM transactions "
-        "WHERE COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') "
+        "WHERE COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra', 'Estoque/Custo Adicional', 'Infraestrutura', 'Software/Infra') "
         "ORDER BY date DESC LIMIT 100"
     )
     if rows:
@@ -601,7 +675,8 @@ with tab_history:
             [
                 "Todos", "Receita", "Despesa", "Estoque",
                 "Aporte Sócio", "Retirada Sócio",
-                "Empréstimo Sócio->Empresa", "Empréstimo Empresa->Sócio", "Amortização Empréstimo"
+                "Empréstimo Sócio->Empresa", "Empréstimo Empresa->Sócio", "Amortização Empréstimo",
+                "Custo Adicional Produto"
             ]
         )
     
@@ -901,6 +976,35 @@ with tab4:
         if selected_pid and selected_pid != "-":
             qty = get_stock_level(int(selected_pid))
             st.info(f"Quantidade em estoque: {qty}")
+
+        st.markdown("**Custos Adicionais por Produto (aumenta CMV futuro)**")
+        cost_product_label = st.selectbox(
+            "Produto para adicionar custo",
+            options=["-"] + [f"{p['id']} - {p['name']}" for p in prods],
+            key="extra_cost_product"
+        )
+        cc1, cc2, cc3 = st.columns(3)
+        extra_cost_amount = cc1.number_input("Valor do Custo (R$)", min_value=0.01, step=0.01, key="extra_cost_amount")
+        extra_cost_date = cc2.date_input("Data do Custo", value=date.today(), key="extra_cost_date")
+        extra_cost_note = cc3.text_input("Motivo/Nota", placeholder="Ex: reparo, componente, frete", key="extra_cost_note")
+
+        if st.button("Adicionar Custo ao Produto", key="btn_add_product_cost"):
+            if cost_product_label == "-":
+                st.warning("Selecione um produto.")
+            else:
+                target_pid = int(cost_product_label.split(" - ")[0])
+                res_adj = create_product_cost_adjustment(
+                    product_id=target_pid,
+                    amount=extra_cost_amount,
+                    date=str(extra_cost_date),
+                    note=extra_cost_note,
+                    is_paid=True
+                )
+                if res_adj:
+                    st.success(f"Custo adicional registrado (id={res_adj}). Será absorvido no CMV das próximas vendas.")
+                    st.rerun()
+                else:
+                    st.error("Não foi possível registrar o custo. Verifique se o produto possui estoque disponível.")
 
     st.divider()
     st.subheader("💰 Gestão de Sócios (Aportes / Retiradas)")

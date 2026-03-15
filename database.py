@@ -183,6 +183,18 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS product_cost_adjustments (
+        id {serial_type},
+        product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+        total_amount DECIMAL(12,2) NOT NULL,
+        base_qty INTEGER NOT NULL,
+        remaining_qty INTEGER NOT NULL,
+        unit_increment DECIMAL(12,6) NOT NULL,
+        date DATE DEFAULT CURRENT_DATE,
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS partner_loans (
         id {serial_type},
         partner_id INTEGER REFERENCES partners(id) ON DELETE SET NULL,

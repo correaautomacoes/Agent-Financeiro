@@ -3,7 +3,21 @@ import os
 from database import get_db_connection, run_query
 
 DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
-NON_OPERATIONAL_CATEGORIES = ("Empréstimo Sócios", "Amortização Empréstimo", "Estoque/Compra")
+NON_OPERATIONAL_CATEGORIES = ("Emprestimo Socios", "Amortizacao Emprestimo", "Estoque/Compra", "Estoque/Custo Adicional")
+INFRA_INVESTMENT_CATEGORIES = ("Infraestrutura", "Software/Infra")
+
+
+def _sql_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _sql_in_list(values: tuple[str, ...]) -> str:
+    return ", ".join(_sql_quote(v) for v in values)
+
+
+NON_OPERATIONAL_SQL = _sql_in_list(NON_OPERATIONAL_CATEGORIES)
+INFRA_INVESTMENT_SQL = _sql_in_list(INFRA_INVESTMENT_CATEGORIES)
+PROFIT_EXPENSE_EXCLUSIONS_SQL = _sql_in_list(NON_OPERATIONAL_CATEGORIES + INFRA_INVESTMENT_CATEGORIES)
 
 
 def _safe_limit(limit: int, default: int = 300, maximum: int = 5000) -> int:
@@ -177,6 +191,73 @@ def get_stock_level(product_id: int) -> int:
         return int(res[0].get("qty", 0))
     return 0
 
+
+def create_product_cost_adjustment(
+    product_id: int,
+    amount: float,
+    date: Optional[str] = None,
+    note: Optional[str] = None,
+    is_paid: bool = True
+) -> Optional[int]:
+    """
+    Registra custo adicional no estoque atual do produto.
+    O valor é distribuído por unidade para compor o CMV nas próximas saídas.
+    """
+    if not _table_exists("product_cost_adjustments"):
+        return None
+
+    total = float(amount or 0)
+    if total <= 0:
+        return None
+
+    base_qty = get_stock_level(product_id)
+    if base_qty <= 0:
+        return None
+
+    unit_increment = total / base_qty
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        dt_val = date if date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
+        dt_sql = ph if date else dt_val
+
+        q = (
+            f"INSERT INTO product_cost_adjustments "
+            f"(product_id, total_amount, base_qty, remaining_qty, unit_increment, date, note) "
+            f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {dt_sql}, {ph})"
+        )
+        params = (product_id, total, base_qty, base_qty, unit_increment, date, note) if date else (product_id, total, base_qty, base_qty, unit_increment, note)
+
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            adj_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            adj_id = cur.lastrowid
+
+        if is_paid:
+            tx_q = f"INSERT INTO transactions (type, amount, category, description, date, product_id) VALUES ('Despesa', {ph}, 'Estoque/Custo Adicional', {ph}, {dt_sql}, {ph})"
+            tx_desc = f"[ADJCOST:{adj_id}] {note or 'Custo adicional de produto'}"
+            tx_params = (total, tx_desc, date, product_id) if date else (total, tx_desc, product_id)
+            cur.execute(tx_q, tx_params)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return adj_id
+    except Exception as e:
+        print(f"Erro create_product_cost_adjustment: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        return None
+
 def create_sale(
     product_id: int,
     quantity: int,
@@ -191,18 +272,48 @@ def create_sale(
         return None
     try:
         cur = conn.cursor()
+        qty_sold = int(quantity)
         avail = get_stock_level(product_id)
-        if avail < quantity:
+        if avail < qty_sold:
             raise Exception(f"Estoque insuficiente ({avail})")
         
         out_unit_cost = _get_latest_in_unit_cost(product_id)
+        extra_cost_total = 0.0
+
+        # Consome custos adicionais pendentes para aumentar CMV das saídas.
+        if _table_exists("product_cost_adjustments"):
+            ph = "?" if DB_TYPE == "sqlite" else "%s"
+            cur.execute(
+                f"SELECT id, unit_increment, remaining_qty FROM product_cost_adjustments WHERE product_id = {ph} AND remaining_qty > 0 ORDER BY id ASC",
+                (product_id,)
+            )
+            adjustments = cur.fetchall() or []
+            qty_left = qty_sold
+            for adj in adjustments:
+                adj_id = adj[0]
+                unit_inc = float(adj[1] or 0)
+                rem_qty = int(adj[2] or 0)
+                if qty_left <= 0:
+                    break
+                if rem_qty <= 0 or unit_inc <= 0:
+                    continue
+                alloc_qty = min(qty_left, rem_qty)
+                extra_cost_total += alloc_qty * unit_inc
+                new_rem = rem_qty - alloc_qty
+                cur.execute(
+                    f"UPDATE product_cost_adjustments SET remaining_qty = {ph} WHERE id = {ph}",
+                    (new_rem, adj_id)
+                )
+                qty_left -= alloc_qty
+
+        blended_unit_cost = out_unit_cost + (extra_cost_total / qty_sold if qty_sold > 0 else 0.0)
         ph = "?" if DB_TYPE == "sqlite" else "%s"
         cur.execute(
             f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, unit_cost) VALUES ({ph}, {ph}, 'out', {ph}, {ph})",
-            (product_id, quantity, description, out_unit_cost)
+            (product_id, qty_sold, description, blended_unit_cost)
         )
         
-        total = float(unit_price) * int(quantity)
+        total = float(unit_price) * qty_sold
         dt_val = sale_date if sale_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
         dt_sql = ph if sale_date else dt_val
         q = f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) VALUES ('Receita', {ph}, 'Venda', {ph}, {dt_sql}, {ph}, {ph}, {ph})"
@@ -495,8 +606,8 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
     query = """
     SELECT 
         p.id, p.name, p.share_pct,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra')) AS total_revenue,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra')) AS total_expenses,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita' AND COALESCE(category,'') NOT IN (""" + NON_OPERATIONAL_SQL + """)) AS total_revenue,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa' AND COALESCE(category,'') NOT IN (""" + PROFIT_EXPENSE_EXCLUSIONS_SQL + """)) AS total_expenses,
         (SELECT COALESCE(SUM(c.amount), 0) FROM contributions c WHERE c.partner_id = p.id) AS total_contributed,
         (SELECT COALESCE(SUM(w.amount), 0) FROM withdrawals w WHERE w.partner_id = p.id) AS total_withdrawn
     FROM partners p
@@ -525,18 +636,31 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
 
 def get_advanced_kpis(period: str = 'month'):
     if DB_TYPE == "postgres":
-        if period == 'week': filter_sql = "date >= CURRENT_DATE - INTERVAL '7 days'"
-        elif period == 'month': filter_sql = "EXTRACT(MONTH FROM date) = EXTRACT(MONTH FROM CURRENT_DATE)"
-        else: filter_sql = "EXTRACT(YEAR FROM date) = EXTRACT(YEAR FROM CURRENT_DATE)"
+        if period == 'week':
+            filter_sql = "date >= CURRENT_DATE - INTERVAL '7 days'"
+            movement_filter_sql = "DATE(m.created_at) >= CURRENT_DATE - INTERVAL '7 days'"
+        elif period == 'month':
+            filter_sql = "DATE_TRUNC('month', date) = DATE_TRUNC('month', CURRENT_DATE)"
+            movement_filter_sql = "DATE_TRUNC('month', m.created_at) = DATE_TRUNC('month', CURRENT_DATE)"
+        else:
+            filter_sql = "EXTRACT(YEAR FROM date) = EXTRACT(YEAR FROM CURRENT_DATE)"
+            movement_filter_sql = "EXTRACT(YEAR FROM m.created_at) = EXTRACT(YEAR FROM CURRENT_DATE)"
     else:
-        if period == 'week': filter_sql = "date >= date('now', '-7 days')"
-        elif period == 'month': filter_sql = "strftime('%m', date) = strftime('%m', 'now')"
-        else: filter_sql = "strftime('%Y', date) = strftime('%Y', 'now')"
+        if period == 'week':
+            filter_sql = "date >= date('now', '-7 days')"
+            movement_filter_sql = "date(m.created_at) >= date('now', '-7 days')"
+        elif period == 'month':
+            filter_sql = "strftime('%Y-%m', date) = strftime('%Y-%m', 'now')"
+            movement_filter_sql = "strftime('%Y-%m', m.created_at) = strftime('%Y-%m', 'now')"
+        else:
+            filter_sql = "strftime('%Y', date) = strftime('%Y', 'now')"
+            movement_filter_sql = "strftime('%Y', m.created_at) = strftime('%Y', 'now')"
     
     # Receita e despesas do período
     q_period = f"""SELECT 
-        COALESCE(SUM(CASE WHEN type='Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') THEN amount ELSE 0 END), 0) AS revenue,
-        COALESCE(SUM(CASE WHEN type='Despesa' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') THEN amount ELSE 0 END), 0) AS expenses
+        COALESCE(SUM(CASE WHEN type='Receita' AND COALESCE(category,'') NOT IN ({NON_OPERATIONAL_SQL}) THEN amount ELSE 0 END), 0) AS revenue,
+        COALESCE(SUM(CASE WHEN type='Despesa' AND COALESCE(category,'') NOT IN ({PROFIT_EXPENSE_EXCLUSIONS_SQL}) THEN amount ELSE 0 END), 0) AS expenses,
+        COALESCE(SUM(CASE WHEN type='Despesa' AND COALESCE(category,'') IN ({INFRA_INVESTMENT_SQL}) THEN amount ELSE 0 END), 0) AS infra_investment
     FROM transactions WHERE {filter_sql}"""
     
     # Saldo total do caixa: todas as receitas - todas as despesas + aportes de sócios - retiradas de sócios
@@ -552,8 +676,7 @@ def get_advanced_kpis(period: str = 'month'):
     q_cmv = f"""
     SELECT COALESCE(SUM(m.unit_cost * m.quantity), 0) as cmv
     FROM stock_movements m
-    JOIN products p ON m.product_id = p.id
-    WHERE m.movement_type = 'out' AND m.unit_cost > 0
+    WHERE m.movement_type = 'out' AND m.unit_cost > 0 AND {movement_filter_sql}
     """
     
     res_period = run_query(q_period)
@@ -564,8 +687,9 @@ def get_advanced_kpis(period: str = 'month'):
         r = res_period[0]
         r['total_cash'] = res_cash[0]['total_cash'] if res_cash else 0
         cmv = float(res_cmv[0]['cmv']) if res_cmv else 0
-        # Lucro real = Receita - Despesas - CMV (Custo dos produtos vendidos)
+        # Lucro operacional exclui investimentos em infraestrutura.
         r['net_profit'] = float(r['revenue']) - float(r['expenses']) - cmv
+        r['accounting_profit'] = r['net_profit'] - float(r.get('infra_investment') or 0)
         r['cmv'] = cmv
         return [r]
     return None
@@ -590,9 +714,9 @@ def get_inventory_report():
         qty = max(int(r['stock_qty']), 0)
         last_cost = float(r['last_cost'] or 0)
         price = float(r['price'] or 0)
-        # Mostra valor total se há estoque, ou valor unitário se estoque zerado (pra nunca aparecer R$0,00)
-        r['total_cost_value'] = last_cost * qty if qty > 0 else last_cost
-        r['total_sale_value'] = price * qty if qty > 0 else price
+        # Para indicadores de estoque, só conta o que está disponível hoje.
+        r['total_cost_value'] = last_cost * qty
+        r['total_sale_value'] = price * qty
         r['stock_qty'] = qty
     return res
 
@@ -600,10 +724,27 @@ def get_revenue_details():
     res = run_query(
         "SELECT CASE WHEN product_id IS NOT NULL THEN 'Venda' ELSE 'Servico' END as channel, SUM(amount) as total "
         "FROM transactions "
-        "WHERE type = 'Receita' AND COALESCE(category,'') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Compra') "
+        f"WHERE type = 'Receita' AND COALESCE(category,'') NOT IN ({NON_OPERATIONAL_SQL}) "
         "GROUP BY channel"
     ) or []
     return res
+
+
+def get_infra_inventory():
+    query = f"""
+    SELECT
+        COALESCE(NULLIF(TRIM(description), ''), category) AS item_name,
+        category,
+        COUNT(*) AS entries,
+        MAX(date) AS last_date,
+        COALESCE(SUM(amount), 0) AS total_invested
+    FROM transactions
+    WHERE type = 'Despesa'
+      AND COALESCE(category, '') IN ({INFRA_INVESTMENT_SQL})
+    GROUP BY COALESCE(NULLIF(TRIM(description), ''), category), category
+    ORDER BY last_date DESC, total_invested DESC
+    """
+    return run_query(query) or []
 
 def get_expense_types(company_id=None):
     if company_id:
@@ -648,6 +789,26 @@ def delete_history_item(source: str, record_id: int) -> bool:
 
     if source == "withdrawal":
         res = run_query("DELETE FROM withdrawals WHERE id = %s", (record_id,))
+        return res is True
+
+    if source == "cost_adjustment":
+        if not _table_exists("product_cost_adjustments"):
+            return False
+        adj_rows = run_query(
+            "SELECT id, base_qty, remaining_qty FROM product_cost_adjustments WHERE id = %s",
+            (record_id,)
+        ) or []
+        if not adj_rows:
+            return False
+        adj = adj_rows[0]
+        # Só permite cancelar se nenhum custo adicional já foi consumido em saídas.
+        if int(adj.get("remaining_qty") or 0) < int(adj.get("base_qty") or 0):
+            return False
+        run_query(
+            "DELETE FROM transactions WHERE category = 'Estoque/Custo Adicional' AND description LIKE %s",
+            (f"[ADJCOST:{record_id}]%",)
+        )
+        res = run_query("DELETE FROM product_cost_adjustments WHERE id = %s", (record_id,))
         return res is True
 
     if source == "loan":
@@ -758,7 +919,7 @@ def get_all_transactions(limit: int = 300) -> List[Dict[str, Any]]:
             'transaction' as source,
             id as source_id
         FROM transactions
-        WHERE COALESCE(category, '') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo')
+        WHERE COALESCE(category, '') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Custo Adicional')
         """,
         """
         SELECT
@@ -818,6 +979,23 @@ def get_all_transactions(limit: int = 300) -> List[Dict[str, Any]]:
             """
         )
 
+    if _table_exists("product_cost_adjustments"):
+        parts.append(
+            """
+            SELECT
+                a.id,
+                CAST(a.date AS TEXT) as date,
+                'Custo Adicional Produto' as type,
+                a.total_amount as amount,
+                'Estoque/Custo Adicional' as category,
+                COALESCE(p.name, 'Produto Removido') || ' (' || COALESCE(a.note, '') || ')' as description,
+                'cost_adjustment' as source,
+                a.id as source_id
+            FROM product_cost_adjustments a
+            LEFT JOIN products p ON p.id = a.product_id
+            """
+        )
+
     if _table_exists("partner_loan_payments") and _table_exists("partner_loans"):
         parts.append(
             """
@@ -858,3 +1036,4 @@ def get_detailed_stock_report() -> List[Dict[str, Any]]:
         r['stock_value_cost'] = float(r['last_cost']) * int(r['current_stock'])
         r['stock_value_sale'] = float(r['price']) * int(r['current_stock'])
     return res
+
