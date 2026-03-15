@@ -467,8 +467,13 @@ with tab2:
     inv_data = get_inventory_report()
     rev_details = get_revenue_details()
     infra_inventory = get_infra_inventory()
+    partner_capital_row = run_query("SELECT COALESCE(SUM(amount), 0) AS total FROM contributions")
     # Mostramos o valor de VENDA total no dashboard (é o potencial de receita parada)
     total_inv_sale = sum([item.get('total_sale_value', 0) for item in inv_data]) if inv_data else 0
+    total_inv_cost = sum([item.get('total_cost_value', 0) for item in inv_data]) if inv_data else 0
+    total_infra_assets = sum([item.get('total_invested', 0) for item in infra_inventory]) if infra_inventory else 0
+    total_partner_capital = float(partner_capital_row[0].get('total', 0)) if partner_capital_row else 0
+    total_invested_capital = total_inv_cost + total_infra_assets
 
     # KPIs Principais
     if kpi_data:
@@ -479,10 +484,11 @@ with tab2:
         top_3.metric("🏷️ CMV", f"R$ {float(k.get('cmv', 0)):.2f}", delta_color="inverse")
         top_4.metric("💡 Lucro Operacional", f"R$ {float(k.get('net_profit', 0)):.2f}")
 
-        bottom_1, bottom_2, bottom_3 = st.columns(3)
+        bottom_1, bottom_2, bottom_3, bottom_4 = st.columns(4)
         bottom_1.metric("🏗️ Invest. em Infra", f"R$ {float(k.get('infra_investment', 0)):.2f}", delta_color="inverse")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
         bottom_3.metric("💰 Saldo em Caixa", f"R$ {float(k.get('total_cash', 0)):.2f}")
+        bottom_4.metric("🏛️ Capital Investido", f"R$ {total_invested_capital:.2f}")
     else:
         top_1, top_2, top_3, top_4 = st.columns(4)
         top_1.metric("📈 Faturamento", "R$ 0.00")
@@ -490,12 +496,17 @@ with tab2:
         top_3.metric("🏷️ CMV", "R$ 0.00")
         top_4.metric("💡 Lucro Operacional", "R$ 0.00")
 
-        bottom_1, bottom_2, bottom_3 = st.columns(3)
+        bottom_1, bottom_2, bottom_3, bottom_4 = st.columns(4)
         bottom_1.metric("🏗️ Invest. em Infra", "R$ 0.00")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
         bottom_3.metric("💰 Saldo em Caixa", "R$ 0.00")
+        bottom_4.metric("🏛️ Capital Investido", f"R$ {total_invested_capital:.2f}")
 
-    st.caption("Infraestrutura e Software/Infra passam a ser mostrados como investimento: afetam o caixa, mas não reduzem o lucro operacional.")
+    extra_1, extra_2 = st.columns(2)
+    extra_1.metric("🤝 Aportes dos Sócios", f"R$ {total_partner_capital:.2f}")
+    extra_2.metric("🧱 Patrimônio Operacional", f"R$ {total_invested_capital + float(kpi_data[0].get('total_cash', 0)):.2f}" if kpi_data else f"R$ {total_invested_capital:.2f}")
+
+    st.caption("Capital Investido = infraestrutura acumulada + estoque atual a custo. Aportes dos Sócios ficam separados porque são a origem do capital, não a aplicação dele.")
 
     # Alertas
     alerts = get_upcoming_alerts()
