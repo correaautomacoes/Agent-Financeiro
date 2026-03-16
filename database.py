@@ -241,6 +241,32 @@ def init_db():
         partner_id INTEGER REFERENCES partners(id) ON DELETE SET NULL,
         company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL
     );
+
+    CREATE TABLE IF NOT EXISTS accounts_receivable (
+        id {serial_type},
+        product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+        partner_id INTEGER REFERENCES partners(id) ON DELETE SET NULL,
+        company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
+        customer_name VARCHAR(255),
+        description TEXT,
+        quantity INTEGER NOT NULL DEFAULT 1,
+        unit_price DECIMAL(12,2) NOT NULL DEFAULT 0,
+        total_amount DECIMAL(12,2) NOT NULL,
+        received_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+        sale_date DATE DEFAULT CURRENT_DATE,
+        due_date DATE,
+        status VARCHAR(20) DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS accounts_receivable_payments (
+        id {serial_type},
+        receivable_id INTEGER REFERENCES accounts_receivable(id) ON DELETE CASCADE,
+        amount DECIMAL(12,2) NOT NULL,
+        payment_date DATE DEFAULT CURRENT_DATE,
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     """
     
     # Executar as criações individualmente se for SQLite (ele prefere) ou tudo junto no postgres

@@ -3,7 +3,13 @@ import os
 from database import get_db_connection, run_query
 
 DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
-NON_OPERATIONAL_CATEGORIES = ("Emprestimo Socios", "Amortizacao Emprestimo", "Estoque/Compra", "Estoque/Custo Adicional")
+NON_OPERATIONAL_CATEGORIES = (
+    "Emprestimo Socios",
+    "Amortizacao Emprestimo",
+    "Estoque/Compra",
+    "Estoque/Custo Adicional",
+    "Recebimento Venda a Prazo",
+)
 INFRA_INVESTMENT_CATEGORIES = ("Infraestrutura", "Software/Infra")
 
 
@@ -374,6 +380,242 @@ def create_sale(
             conn.close()
         return None
 
+
+def create_credit_sale(
+    product_id: int,
+    quantity: int,
+    unit_price: float,
+    due_date: str,
+    customer_name: Optional[str] = None,
+    company_id: Optional[int] = None,
+    partner_id: Optional[int] = None,
+    description: Optional[str] = None,
+    sale_date: Optional[str] = None
+) -> Optional[int]:
+    if not _table_exists("accounts_receivable") or not _table_exists("accounts_receivable_payments"):
+        return None
+
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        qty_sold = int(quantity)
+        avail = get_stock_level(product_id)
+        if avail < qty_sold:
+            raise Exception(f"Estoque insuficiente ({avail})")
+
+        estimate = estimate_sale_cost(product_id, qty_sold)
+        blended_unit_cost = float(estimate["estimated_unit_cost"])
+        total = float(unit_price) * qty_sold
+        sale_note = (description or "").strip()
+        customer = (customer_name or "").strip() or None
+
+        if _table_exists("product_cost_adjustments"):
+            ph = "?" if DB_TYPE == "sqlite" else "%s"
+            adjustments = _get_pending_cost_adjustments(product_id)
+            for adj in adjustments:
+                adj_id = int(adj["id"])
+                rem_qty = int(adj["remaining_qty"] or 0)
+                unit_inc = float(adj["unit_increment"] or 0)
+                if rem_qty <= 0 or unit_inc <= 0:
+                    continue
+                alloc_qty = min(qty_sold, rem_qty)
+                new_rem = rem_qty - alloc_qty
+                cur.execute(
+                    f"UPDATE product_cost_adjustments SET remaining_qty = {ph} WHERE id = {ph}",
+                    (new_rem, adj_id)
+                )
+
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        dt_val = sale_date if sale_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
+        dt_sql = ph if sale_date else dt_val
+        due_sql = ph
+        recv_q = (
+            f"INSERT INTO accounts_receivable "
+            f"(product_id, partner_id, company_id, customer_name, description, quantity, unit_price, total_amount, received_amount, sale_date, due_date, status) "
+            f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 0, {dt_sql}, {due_sql}, 'open')"
+        )
+        recv_params = (
+            (product_id, partner_id, company_id, customer, sale_note, qty_sold, float(unit_price), total, sale_date, due_date)
+            if sale_date else
+            (product_id, partner_id, company_id, customer, sale_note, qty_sold, float(unit_price), total, due_date)
+        )
+
+        if DB_TYPE == "postgres":
+            cur.execute(recv_q + " RETURNING id", recv_params)
+            receivable_id = cur.fetchone()[0]
+        else:
+            cur.execute(recv_q, recv_params)
+            receivable_id = cur.lastrowid
+
+        reference = f"[ARSALE:{receivable_id}] {sale_note}".strip()
+        cur.execute(
+            f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, unit_cost) VALUES ({ph}, {ph}, 'out', {ph}, {ph})",
+            (product_id, qty_sold, reference, blended_unit_cost)
+        )
+
+        tx_q = (
+            f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) "
+            f"VALUES ('Receita', {ph}, 'Venda a Prazo', {ph}, {dt_sql}, {ph}, {ph}, {ph})"
+        )
+        tx_params = (
+            (total, reference, sale_date, product_id, partner_id, company_id)
+            if sale_date else
+            (total, reference, product_id, partner_id, company_id)
+        )
+        cur.execute(tx_q, tx_params)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return receivable_id
+    except Exception as e:
+        print(f"Erro create_credit_sale: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        return None
+
+
+def add_receivable_payment(
+    receivable_id: int,
+    amount: float,
+    payment_date: Optional[str] = None,
+    note: Optional[str] = None
+) -> Optional[int]:
+    if not _table_exists("accounts_receivable") or not _table_exists("accounts_receivable_payments"):
+        return None
+
+    payment_amount = float(amount or 0)
+    if payment_amount <= 0:
+        return None
+
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        receivable_rows = run_query(
+            "SELECT * FROM accounts_receivable WHERE id = %s",
+            (receivable_id,)
+        ) or []
+        if not receivable_rows:
+            raise Exception("Conta a receber não encontrada.")
+
+        receivable = receivable_rows[0]
+        total_amount = float(receivable.get("total_amount") or 0)
+        received_amount = float(receivable.get("received_amount") or 0)
+        remaining_amount = total_amount - received_amount
+        if payment_amount > remaining_amount + 0.0001:
+            raise Exception(f"Pagamento maior que o saldo pendente (R$ {remaining_amount:.2f}).")
+
+        dt_val = payment_date if payment_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
+        dt_sql = ph if payment_date else dt_val
+        pay_q = (
+            f"INSERT INTO accounts_receivable_payments (receivable_id, amount, payment_date, note) "
+            f"VALUES ({ph}, {ph}, {dt_sql}, {ph})"
+        )
+        pay_params = (receivable_id, payment_amount, payment_date, note) if payment_date else (receivable_id, payment_amount, note)
+
+        if DB_TYPE == "postgres":
+            cur.execute(pay_q + " RETURNING id", pay_params)
+            payment_id = cur.fetchone()[0]
+        else:
+            cur.execute(pay_q, pay_params)
+            payment_id = cur.lastrowid
+
+        new_received = received_amount + payment_amount
+        new_status = "paid" if new_received >= total_amount - 0.0001 else "partial"
+        cur.execute(
+            f"UPDATE accounts_receivable SET received_amount = {ph}, status = {ph} WHERE id = {ph}",
+            (new_received, new_status, receivable_id)
+        )
+
+        tx_desc = f"[ARPAY:{payment_id}|ARSALE:{receivable_id}] {note or receivable.get('description') or ''}".strip()
+        tx_q = (
+            f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) "
+            f"VALUES ('Receita', {ph}, 'Recebimento Venda a Prazo', {ph}, {dt_sql}, {ph}, {ph}, {ph})"
+        )
+        tx_params = (
+            (payment_amount, tx_desc, payment_date, receivable.get("product_id"), receivable.get("partner_id"), receivable.get("company_id"))
+            if payment_date else
+            (payment_amount, tx_desc, receivable.get("product_id"), receivable.get("partner_id"), receivable.get("company_id"))
+        )
+        cur.execute(tx_q, tx_params)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return payment_id
+    except Exception as e:
+        print(f"Erro add_receivable_payment: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        return None
+
+
+def get_accounts_receivable_summary() -> Dict[str, Any]:
+    if not _table_exists("accounts_receivable"):
+        return {
+            "open_amount": 0.0,
+            "overdue_amount": 0.0,
+            "total_open_titles": 0,
+            "items": [],
+        }
+
+    outstanding_expr = "(ar.total_amount - ar.received_amount)"
+    if DB_TYPE == "postgres":
+        overdue_sql = f"CASE WHEN ar.due_date IS NOT NULL AND ar.due_date < CURRENT_DATE THEN {outstanding_expr} ELSE 0 END"
+    else:
+        overdue_sql = f"CASE WHEN ar.due_date IS NOT NULL AND ar.due_date < date('now') THEN {outstanding_expr} ELSE 0 END"
+
+    query = f"""
+    SELECT
+        ar.id,
+        ar.customer_name,
+        ar.description,
+        ar.quantity,
+        ar.unit_price,
+        ar.total_amount,
+        ar.received_amount,
+        {outstanding_expr} AS outstanding_amount,
+        ar.sale_date,
+        ar.due_date,
+        ar.status,
+        p.name AS product_name,
+        {overdue_sql} AS overdue_amount
+    FROM accounts_receivable ar
+    LEFT JOIN products p ON p.id = ar.product_id
+    WHERE (ar.total_amount - ar.received_amount) > 0
+    ORDER BY
+        CASE WHEN ar.due_date IS NULL THEN 1 ELSE 0 END,
+        ar.due_date ASC,
+        ar.id DESC
+    """
+    items = run_query(query) or []
+    for item in items:
+        item["outstanding_amount"] = float(item.get("outstanding_amount") or 0)
+        item["overdue_amount"] = float(item.get("overdue_amount") or 0)
+        item["received_amount"] = float(item.get("received_amount") or 0)
+        item["total_amount"] = float(item.get("total_amount") or 0)
+        item["unit_price"] = float(item.get("unit_price") or 0)
+
+    return {
+        "open_amount": sum(item["outstanding_amount"] for item in items),
+        "overdue_amount": sum(item["overdue_amount"] for item in items),
+        "total_open_titles": len(items),
+        "items": items,
+    }
+
 def create_contribution(partner_id: int, amount: float, date: Optional[str] = None, note: Optional[str] = None) -> Optional[int]:
     conn = get_db_connection()
     if not conn:
@@ -662,14 +904,26 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
         FROM stock_movements m WHERE m.movement_type = 'out' AND m.unit_cost > 0
     """)
     cmv_total = float(cmv_res[0]['cmv']) if cmv_res else 0.0
+
+    receivable_open_total = 0.0
+    if _table_exists("accounts_receivable"):
+        receivable_rows = run_query(
+            "SELECT COALESCE(SUM(total_amount - received_amount), 0) AS total FROM accounts_receivable WHERE (total_amount - received_amount) > 0"
+        ) or []
+        receivable_open_total = float(receivable_rows[0].get("total", 0) or 0) if receivable_rows else 0.0
     
     for r in res:
         # Lucro real = Receita - Despesas - CMV
         lucro_real = float(r['total_revenue']) - float(r['total_expenses']) - cmv_total
+        share_ratio = float(r['share_pct']) / 100.0
         # Cota do sócio no lucro operacional
-        r['share_of_profit'] = lucro_real * (float(r['share_pct']) / 100.0)
-        # Saldo = Cota no lucro + aportes feitos - retiradas já feitas
+        r['share_of_profit'] = lucro_real * share_ratio
+        # Parte do lucro ainda "presa" em vendas a prazo abertas.
+        r['pending_receivable_balance'] = receivable_open_total * share_ratio
+        # Saldo teórico total = lucro + aportes - retiradas.
         r['current_balance'] = r['share_of_profit'] + float(r['total_contributed']) - float(r['total_withdrawn'])
+        # Saldo disponível = saldo total menos a fatia ainda não recebida do contas a receber.
+        r['available_balance'] = r['current_balance'] - r['pending_receivable_balance']
     return res
 
 def get_advanced_kpis(period: str = 'month'):
@@ -704,7 +958,16 @@ def get_advanced_kpis(period: str = 'month'):
     # Saldo total do caixa: todas as receitas - todas as despesas + aportes de sócios - retiradas de sócios
     q_cash = """
     SELECT 
-        (SELECT COALESCE(SUM(CASE WHEN type='Receita' THEN amount ELSE -amount END), 0) FROM transactions)
+        (
+            SELECT COALESCE(SUM(
+                CASE
+                    WHEN type='Receita' AND COALESCE(category, '') = 'Venda a Prazo' THEN 0
+                    WHEN type='Receita' THEN amount
+                    ELSE -amount
+                END
+            ), 0)
+            FROM transactions
+        )
         + (SELECT COALESCE(SUM(amount), 0) FROM contributions)
         - (SELECT COALESCE(SUM(amount), 0) FROM withdrawals)
     AS total_cash
@@ -893,6 +1156,72 @@ def delete_history_item(source: str, record_id: int) -> bool:
         res = run_query("DELETE FROM partner_loan_payments WHERE id = %s", (record_id,))
         return res is True
 
+    if source == "receivable":
+        if not _table_exists("accounts_receivable") or not _table_exists("accounts_receivable_payments"):
+            return False
+        payments = run_query(
+            "SELECT id FROM accounts_receivable_payments WHERE receivable_id = %s LIMIT 1",
+            (record_id,)
+        ) or []
+        if payments:
+            return False
+
+        recv_rows = run_query(
+            "SELECT id, product_id, description FROM accounts_receivable WHERE id = %s",
+            (record_id,)
+        ) or []
+        if not recv_rows:
+            return False
+        recv = recv_rows[0]
+        ref = f"[ARSALE:{record_id}] {recv.get('description') or ''}".strip()
+
+        if recv.get("product_id"):
+            mv = run_query(
+                "SELECT id FROM stock_movements WHERE product_id = %s AND movement_type='out' AND reference = %s ORDER BY id DESC LIMIT 1",
+                (recv["product_id"], ref)
+            ) or []
+            if mv:
+                run_query("DELETE FROM stock_movements WHERE id = %s", (mv[0]["id"],))
+
+        run_query(
+            "DELETE FROM transactions WHERE category = 'Venda a Prazo' AND description LIKE %s",
+            (f"[ARSALE:{record_id}]%",)
+        )
+        res = run_query("DELETE FROM accounts_receivable WHERE id = %s", (record_id,))
+        return res is True
+
+    if source == "receivable_payment":
+        if not _table_exists("accounts_receivable") or not _table_exists("accounts_receivable_payments"):
+            return False
+        pay_rows = run_query(
+            "SELECT id, receivable_id, amount FROM accounts_receivable_payments WHERE id = %s",
+            (record_id,)
+        ) or []
+        if not pay_rows:
+            return False
+        pay = pay_rows[0]
+
+        recv_rows = run_query(
+            "SELECT total_amount, received_amount FROM accounts_receivable WHERE id = %s",
+            (pay["receivable_id"],)
+        ) or []
+        if not recv_rows:
+            return False
+        recv = recv_rows[0]
+        new_received = max(float(recv.get("received_amount") or 0) - float(pay.get("amount") or 0), 0.0)
+        total_amount = float(recv.get("total_amount") or 0)
+        new_status = "open" if new_received <= 0 else ("paid" if new_received >= total_amount - 0.0001 else "partial")
+        run_query(
+            "UPDATE accounts_receivable SET received_amount = %s, status = %s WHERE id = %s",
+            (new_received, new_status, pay["receivable_id"])
+        )
+        run_query(
+            "DELETE FROM transactions WHERE category = 'Recebimento Venda a Prazo' AND description LIKE %s",
+            (f"[ARPAY:{record_id}|ARSALE:{pay['receivable_id']}]%",)
+        )
+        res = run_query("DELETE FROM accounts_receivable_payments WHERE id = %s", (record_id,))
+        return res is True
+
     if source == "stock":
         mv_rows = run_query(
             "SELECT id, product_id, movement_type, reference FROM stock_movements WHERE id = %s",
@@ -961,7 +1290,7 @@ def get_all_transactions(limit: int = 300) -> List[Dict[str, Any]]:
             'transaction' as source,
             id as source_id
         FROM transactions
-        WHERE COALESCE(category, '') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Custo Adicional')
+        WHERE COALESCE(category, '') NOT IN ('Empréstimo Sócios', 'Amortização Empréstimo', 'Estoque/Custo Adicional', 'Venda a Prazo', 'Recebimento Venda a Prazo')
         """,
         """
         SELECT
@@ -1056,6 +1385,41 @@ def get_all_transactions(limit: int = 300) -> List[Dict[str, Any]]:
             """
         )
 
+    if _table_exists("accounts_receivable"):
+        parts.append(
+            """
+            SELECT
+                ar.id,
+                CAST(ar.sale_date AS TEXT) as date,
+                'Venda a Prazo' as type,
+                ar.total_amount as amount,
+                'Venda a Prazo' as category,
+                COALESCE(p.name, 'Produto Removido') || ' | Cliente: ' || COALESCE(ar.customer_name, 'Nao informado') || ' | ' || COALESCE(ar.description, '') as description,
+                'receivable' as source,
+                ar.id as source_id
+            FROM accounts_receivable ar
+            LEFT JOIN products p ON p.id = ar.product_id
+            """
+        )
+
+    if _table_exists("accounts_receivable_payments") and _table_exists("accounts_receivable"):
+        parts.append(
+            """
+            SELECT
+                pay.id,
+                CAST(pay.payment_date AS TEXT) as date,
+                'Recebimento a Prazo' as type,
+                pay.amount as amount,
+                'Recebimento Venda a Prazo' as category,
+                COALESCE(p.name, 'Produto Removido') || ' | Cliente: ' || COALESCE(ar.customer_name, 'Nao informado') || ' | ' || COALESCE(pay.note, ar.description, '') as description,
+                'receivable_payment' as source,
+                pay.id as source_id
+            FROM accounts_receivable_payments pay
+            LEFT JOIN accounts_receivable ar ON ar.id = pay.receivable_id
+            LEFT JOIN products p ON p.id = ar.product_id
+            """
+        )
+
     query = " UNION ALL ".join(parts) + f" ORDER BY date DESC, id DESC LIMIT {safe_limit}"
     return run_query(query) or []
 
@@ -1083,4 +1447,3 @@ def get_detailed_stock_report() -> List[Dict[str, Any]]:
         r['stock_value_cost'] = (base_cost * qty) + pending_total
         r['stock_value_sale'] = float(r['price']) * int(r['current_stock'])
     return res
-

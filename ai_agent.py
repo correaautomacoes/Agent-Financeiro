@@ -89,7 +89,7 @@ def process_chat_command(user_input, context_data=None, suggested_intent=None, e
 
         INTENÇÕES SUPORTADAS:
         1. `SAVE_TRANSACTION`: Lançar uma receita ou despesa genérica.
-        2. `REGISTER_SALE`: Lançar venda de um produto (mencionar produto e quantidade).
+        2. `REGISTER_SALE`: Lançar venda de um produto (mencionar produto e quantidade). Se o texto indicar "a prazo", marque como venda a prazo.
         3. `STOCK_MOVEMENT`: Entrada ou Saída de estoque. Se for entrada, identifique se foi "pago" (retirado do caixa) ou "consignado".
         4. `PARTNER_CONTRIBUTION`: Aporte financeiro de um sócio.
         5. `PARTNER_WITHDRAWAL`: Retirada/Saque de lucros de um sócio.
@@ -101,6 +101,8 @@ def process_chat_command(user_input, context_data=None, suggested_intent=None, e
         - Retorne APENAS um JSON.
         - Se a informação estiver incompleta (ex: falta o preço ou a quantidade inicial em CREATE_PRODUCT), preencha o campo "status" como "INCOMPLETE".
         - Se for `STOCK_MOVEMENT` ou entrada inicial de `CREATE_PRODUCT`, pergunte se foi pago ou consignado se não estiver claro.
+        - Se for `REGISTER_SALE` e o usuário disser "a prazo", preencha `payment_mode` = "credit".
+        - Em venda a prazo, se faltar vencimento, deixe status `INCOMPLETE` e pergunte a data. Se houver nome do cliente, preencha `customer_name`.
 
         ESTRUTURA DO JSON ESPERADO:
         {{
@@ -115,7 +117,10 @@ def process_chat_command(user_input, context_data=None, suggested_intent=None, e
                 "quantity": int (opcional),
                 "partner_id": int (OBRIGATÓRIO mapear pelo Contexto se o sócio já existir),
                 "source": "próprio" | "consignado" (opcional),
-                "is_paid": boolean (opcional)
+                "is_paid": boolean (opcional),
+                "payment_mode": "cash" | "credit" (opcional),
+                "due_date": "YYYY-MM-DD" (opcional),
+                "customer_name": string (opcional)
             }},
             "missing_fields": ["Qual a quantidade?", "Foi pago ou consignado?"]
         }}

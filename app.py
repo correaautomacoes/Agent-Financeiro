@@ -11,10 +11,11 @@ from db_helpers import (
     create_product, get_products,
     add_stock_movement, get_stock_level,
     get_expense_types, get_income_types,
-    create_sale, create_contribution, create_withdrawal, create_product_cost_adjustment,
+    create_sale, create_credit_sale, add_receivable_payment,
+    create_contribution, create_withdrawal, create_product_cost_adjustment,
     create_partner_loan, add_partner_loan_payment, get_partner_loans, get_partner_loans_summary,
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
-    create_fixed_expense, get_inventory_report, get_revenue_details, get_infra_inventory,
+    create_fixed_expense, get_inventory_report, get_revenue_details, get_infra_inventory, get_accounts_receivable_summary,
     estimate_sale_cost,
     delete_history_item, get_all_transactions, get_detailed_stock_report,
     get_categories, create_category
@@ -143,14 +144,22 @@ with tab1:
                     
                     elif intent == "REGISTER_SALE":
                         if p_id:
-                            # Usa o helper de venda que já baixa estoque
-                            res = create_sale(
+                            # Usa o helper de venda que já baixa estoque.
+                            sale_kwargs = dict(
                                 product_id=p_id,
                                 quantity=data.get("quantity", 1),
                                 unit_price=data.get("amount", 0) / data.get("quantity", 1) if data.get("quantity", 1) > 0 else 0,
                                 description=data.get("description"),
                                 sale_date=data.get("date")
                             )
+                            if data.get("payment_mode") == "credit":
+                                res = create_credit_sale(
+                                    **sale_kwargs,
+                                    due_date=data.get("due_date") or data.get("date"),
+                                    customer_name=data.get("customer_name")
+                                )
+                            else:
+                                res = create_sale(**sale_kwargs)
                             success = res is not None
                         else:
                             st.error("Produto não identificado. Tente dizer o nome correto do produto ou crie-o primeiro.")
@@ -266,14 +275,93 @@ with tab_manual:
                 col_d1, col_d2 = st.columns(2)
                 data_venda = col_d1.date_input("Data da Venda", value=date.today(), key="v_data")
                 desc_venda = col_d2.text_input("Observação (opcional)", placeholder="Ex: Venda balcão")
+
+                modalidade_venda = st.radio(
+                    "Modalidade",
+                    ["À vista", "A prazo"],
+                    horizontal=True,
+                    key="sale_mode"
+                )
+
+                customer_name = ""
+                due_date = data_venda
+                if modalidade_venda == "A prazo":
+                    col_c1, col_c2 = st.columns(2)
+                    customer_name = col_c1.text_input("Cliente / referência", placeholder="Ex: João, Pedido #123")
+                    due_date = col_c2.date_input("Vencimento", value=data_venda, key="credit_due_date")
+                    saldo_resumo = get_accounts_receivable_summary()
+                    st.caption(
+                        f"Saldo atual a receber: R$ {float(saldo_resumo.get('open_amount', 0)):.2f} "
+                        f"em {int(saldo_resumo.get('total_open_titles', 0))} título(s)."
+                    )
                 
                 if st.button("🚀 Registrar Venda", use_container_width=True):
-                    res = create_sale(p_id, qty_venda, preco_venda, description=desc_venda, sale_date=str(data_venda))
+                    if modalidade_venda == "A prazo":
+                        res = create_credit_sale(
+                            p_id,
+                            qty_venda,
+                            preco_venda,
+                            due_date=str(due_date),
+                            customer_name=customer_name,
+                            description=desc_venda,
+                            sale_date=str(data_venda)
+                        )
+                    else:
+                        res = create_sale(p_id, qty_venda, preco_venda, description=desc_venda, sale_date=str(data_venda))
+
                     if res:
-                        st.success(f"✅ Venda de R$ {total_venda:.2f} registrada!")
+                        venda_label = "venda a prazo" if modalidade_venda == "A prazo" else "venda"
+                        st.success(f"✅ {venda_label.capitalize()} de R$ {total_venda:.2f} registrada!")
                         st.rerun()
                     else:
-                        st.error("Erro ao registrar venda. Verifique o estoque disponível.")
+                        st.error("Erro ao registrar venda. Verifique o estoque disponível e os dados informados.")
+
+        st.divider()
+        st.subheader("Receber Venda a Prazo")
+        receivable_summary = get_accounts_receivable_summary()
+        open_titles = receivable_summary.get("items", [])
+        if open_titles:
+            receivable_options = {
+                f"#{item['id']} | {item.get('product_name') or 'Produto'} | Cliente: {item.get('customer_name') or 'Não informado'} | "
+                f"Saldo: R$ {float(item.get('outstanding_amount') or 0):.2f} | Vence: {item.get('due_date') or 'Sem vencimento'}": item
+                for item in open_titles
+            }
+            selected_receivable_label = st.selectbox(
+                "Título em aberto",
+                options=list(receivable_options.keys()),
+                key="receivable_select"
+            )
+            selected_receivable = receivable_options[selected_receivable_label]
+            max_receivable_amount = float(selected_receivable.get("outstanding_amount") or 0)
+
+            col_r1, col_r2, col_r3 = st.columns(3)
+            payment_input_kwargs = {
+                "label": "Valor recebido (R$)",
+                "min_value": 0.01,
+                "value": max_receivable_amount if max_receivable_amount > 0 else 0.01,
+                "step": 0.01,
+                "key": "receivable_payment_amount",
+            }
+            if max_receivable_amount > 0:
+                payment_input_kwargs["max_value"] = max_receivable_amount
+            payment_amount = col_r1.number_input(**payment_input_kwargs)
+            payment_date = col_r2.date_input("Data do recebimento", value=date.today(), key="receivable_payment_date")
+            payment_note = col_r3.text_input("Nota", placeholder="Ex: Pix recebido", key="receivable_payment_note")
+
+            if st.button("💸 Registrar Recebimento", use_container_width=True):
+                payment_id = add_receivable_payment(
+                    int(selected_receivable["id"]),
+                    payment_amount,
+                    payment_date=str(payment_date),
+                    note=payment_note
+                )
+                if payment_id:
+                    st.success("Recebimento registrado com sucesso!")
+                    st.rerun()
+                else:
+                    st.error("Não foi possível registrar o recebimento. Revise o valor informado.")
+        else:
+            st.info("Nenhuma venda a prazo em aberto no momento.")
 
     with sub_tab2:
         st.subheader("Nova Receita ou Despesa")
@@ -470,6 +558,7 @@ with tab2:
     inv_data = get_inventory_report()
     rev_details = get_revenue_details()
     infra_inventory = get_infra_inventory()
+    receivable_summary = get_accounts_receivable_summary()
     partner_capital_row = run_query("SELECT COALESCE(SUM(amount), 0) AS total FROM contributions")
     # Mostramos o valor de VENDA total no dashboard (é o potencial de receita parada)
     total_inv_sale = sum([item.get('total_sale_value', 0) for item in inv_data]) if inv_data else 0
@@ -491,7 +580,7 @@ with tab2:
         bottom_1.metric("🏗️ Invest. em Infra", f"R$ {float(k.get('infra_investment', 0)):.2f}", delta_color="inverse")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
         bottom_3.metric("💰 Saldo em Caixa", f"R$ {float(k.get('total_cash', 0)):.2f}")
-        bottom_4.metric("🏛️ Capital Investido", f"R$ {total_invested_capital:.2f}")
+        bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
     else:
         top_1, top_2, top_3, top_4 = st.columns(4)
         top_1.metric("📈 Faturamento", "R$ 0.00")
@@ -503,13 +592,15 @@ with tab2:
         bottom_1.metric("🏗️ Invest. em Infra", "R$ 0.00")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
         bottom_3.metric("💰 Saldo em Caixa", "R$ 0.00")
-        bottom_4.metric("🏛️ Capital Investido", f"R$ {total_invested_capital:.2f}")
+        bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
 
-    extra_1, extra_2 = st.columns(2)
+    extra_1, extra_2, extra_3 = st.columns(3)
     extra_1.metric("🤝 Aportes dos Sócios", f"R$ {total_partner_capital:.2f}")
-    extra_2.metric("🧱 Patrimônio Operacional", f"R$ {total_invested_capital + float(kpi_data[0].get('total_cash', 0)):.2f}" if kpi_data else f"R$ {total_invested_capital:.2f}")
+    extra_2.metric("🏛️ Capital Investido", f"R$ {total_invested_capital:.2f}")
+    extra_3.metric("🧱 Patrimônio Operacional", f"R$ {total_invested_capital + float(kpi_data[0].get('total_cash', 0)) + float(receivable_summary.get('open_amount', 0)):.2f}" if kpi_data else f"R$ {total_invested_capital + float(receivable_summary.get('open_amount', 0)):.2f}")
 
     st.caption("Capital Investido = infraestrutura acumulada + estoque atual a custo. Aportes dos Sócios ficam separados porque são a origem do capital, não a aplicação dele.")
+    st.caption("Saldo em Caixa não inclui vendas a prazo ainda não recebidas. O card 'A Prazo a Receber' mostra exatamente o que ainda falta entrar.")
 
     # Alertas
     alerts = get_upcoming_alerts()
@@ -518,6 +609,33 @@ with tab2:
         with st.expander("Ver Alertas"):
             for a in alerts:
                 st.write(f"- {a['name']}: **R$ {a['amount']:.2f}** (Dia {a['due_day']})")
+
+    st.divider()
+
+    st.subheader("🧾 Contas a Receber")
+    ar1, ar2, ar3 = st.columns(3)
+    ar1.metric("Saldo em Aberto", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
+    ar2.metric("Vencido", f"R$ {float(receivable_summary.get('overdue_amount', 0)):.2f}", delta_color="inverse")
+    ar3.metric("Títulos em Aberto", int(receivable_summary.get('total_open_titles', 0)))
+
+    receivable_items = receivable_summary.get("items", [])
+    if receivable_items:
+        ar_df = pd.DataFrame(receivable_items)[[
+            'id', 'product_name', 'customer_name', 'sale_date', 'due_date',
+            'total_amount', 'received_amount', 'outstanding_amount', 'status'
+        ]].copy()
+        ar_df.columns = ['ID', 'Produto', 'Cliente', 'Data Venda', 'Vencimento', 'Total', 'Recebido', 'Saldo', 'Status']
+        st.dataframe(
+            ar_df.style.format({
+                'Total': 'R$ {:.2f}',
+                'Recebido': 'R$ {:.2f}',
+                'Saldo': 'R$ {:.2f}'
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Nenhuma venda a prazo em aberto.")
 
     st.divider()
 
@@ -575,13 +693,20 @@ with tab2:
         if isinstance(partner_reps, list) and len(partner_reps) > 0:
             pdf = pd.DataFrame(partner_reps)
             # Formatar colunas para exibição
-            display_df = pdf[['name', 'share_pct', 'share_of_profit', 'total_withdrawn', 'current_balance']].copy()
-            display_df.columns = ['Sócio', '% Participação', 'Lucro Gerado', 'Total Retirado', 'Saldo Disponível']
+            display_df = pdf[[
+                'name', 'share_pct', 'share_of_profit',
+                'pending_receivable_balance', 'available_balance', 'total_withdrawn'
+            ]].copy()
+            display_df.columns = [
+                'Sócio', '% Participação', 'Lucro Gerado',
+                'Saldo Pendente a Receber', 'Saldo Disponível', 'Total Retirado'
+            ]
             st.table(display_df.style.format({
                 '% Participação': '{:.1f}%',
                 'Lucro Gerado': 'R$ {:.2f}',
+                'Saldo Pendente a Receber': 'R$ {:.2f}',
+                'Saldo Disponível': 'R$ {:.2f}',
                 'Total Retirado': 'R$ {:.2f}',
-                'Saldo Disponível': 'R$ {:.2f}'
             }))
         else:
             st.info("Cadastre sócios na aba 'Gerenciar'.")
@@ -690,7 +815,7 @@ with tab_history:
                 "Todos", "Receita", "Despesa", "Estoque",
                 "Aporte Sócio", "Retirada Sócio",
                 "Empréstimo Sócio->Empresa", "Empréstimo Empresa->Sócio", "Amortização Empréstimo",
-                "Custo Adicional Produto"
+                "Custo Adicional Produto", "Venda a Prazo", "Recebimento a Prazo"
             ]
         )
     
@@ -1385,4 +1510,3 @@ with tab5:
                 st.success("✅ PDF completo gerado com todas as seções!")
             except Exception as e:
                 st.error(f"Erro ao gerar PDF: {e}")
-

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Agente Financeiro
+Comment=Abre o sistema financeiro local
+Exec=/home/matt/Documentos/Agente\ FInanceiro/Agent-Financeiro/launch_agente_financeiro.sh
+Path=/home/matt/Documentos/Agente FInanceiro/Agent-Financeiro
+Terminal=false
+Categories=Office;Finance;
