@@ -267,6 +267,21 @@ def init_db():
         note TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS receivables (
+        id {serial_type},
+        product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+        sale_transaction_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
+        installment_no INTEGER DEFAULT 1,
+        total_installments INTEGER DEFAULT 1,
+        amount DECIMAL(12,2) NOT NULL,
+        due_date DATE NOT NULL,
+        status VARCHAR(20) DEFAULT 'pending',
+        paid_amount DECIMAL(12,2) DEFAULT 0,
+        paid_date DATE,
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     """
     
     # Executar as criações individualmente se for SQLite (ele prefere) ou tudo junto no postgres
@@ -283,6 +298,8 @@ def init_db():
             run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'próprio'")
             run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS is_paid BOOLEAN DEFAULT FALSE")
             run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS unit_cost DECIMAL(12,2) DEFAULT 0")
+            run_query("ALTER TABLE receivables ADD COLUMN IF NOT EXISTS paid_amount DECIMAL(12,2) DEFAULT 0")
+            run_query("ALTER TABLE receivables ADD COLUMN IF NOT EXISTS paid_date DATE")
     except: pass
 
     # Backfill: preenche custo em saídas antigas sem unit_cost para habilitar CMV correto.

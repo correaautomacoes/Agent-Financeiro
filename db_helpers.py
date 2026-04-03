@@ -5,7 +5,9 @@ from database import get_db_connection, run_query
 DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
 NON_OPERATIONAL_CATEGORIES = (
     "Emprestimo Socios",
+    "Empr\u00e9stimo S\u00f3cios",
     "Amortizacao Emprestimo",
+    "Amortiza\u00e7\u00e3o Empr\u00e9stimo",
     "Estoque/Compra",
     "Estoque/Custo Adicional",
     "Recebimento Venda a Prazo",
@@ -24,6 +26,17 @@ def _sql_in_list(values: tuple[str, ...]) -> str:
 NON_OPERATIONAL_SQL = _sql_in_list(NON_OPERATIONAL_CATEGORIES)
 INFRA_INVESTMENT_SQL = _sql_in_list(INFRA_INVESTMENT_CATEGORIES)
 PROFIT_EXPENSE_EXCLUSIONS_SQL = _sql_in_list(NON_OPERATIONAL_CATEGORIES + INFRA_INVESTMENT_CATEGORIES)
+LOAN_TAG_EXCLUSION_SQL = "COALESCE(description,'') NOT LIKE '[LOAN:%' AND COALESCE(description,'') NOT LIKE '[LOANPAY:%'"
+# Blindagem extra para dados legados/manuais sem tags padronizadas.
+LOAN_TEXT_EXCLUSION_SQL = (
+    "LOWER(COALESCE(category,'')) NOT LIKE '%emprest%' "
+    "AND LOWER(COALESCE(category,'')) NOT LIKE '%emprést%' "
+    "AND LOWER(COALESCE(category,'')) NOT LIKE '%amortiz%' "
+    "AND LOWER(COALESCE(description,'')) NOT LIKE '%emprest%' "
+    "AND LOWER(COALESCE(description,'')) NOT LIKE '%emprést%' "
+    "AND LOWER(COALESCE(description,'')) NOT LIKE '%amortiz%'"
+)
+NON_OPERATIONAL_EXCLUSION_SQL = f"{LOAN_TAG_EXCLUSION_SQL} AND {LOAN_TEXT_EXCLUSION_SQL}"
 
 
 def _safe_limit(limit: int, default: int = 300, maximum: int = 5000) -> int:
@@ -312,6 +325,92 @@ def create_product_cost_adjustment(
             conn.close()
         return None
 
+def get_receivables_summary() -> Dict[str, float]:
+    if not _table_exists("receivables"):
+        return {"pending_total": 0.0, "received_total": 0.0, "overdue_total": 0.0}
+
+    rows = run_query(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN status = 'pending' THEN amount - COALESCE(paid_amount, 0) ELSE 0 END), 0) AS pending_total,
+            COALESCE(SUM(CASE WHEN status = 'paid' THEN COALESCE(paid_amount, amount) ELSE 0 END), 0) AS received_total,
+            COALESCE(SUM(CASE
+                WHEN status = 'pending' AND due_date < (CURRENT_DATE) THEN amount - COALESCE(paid_amount, 0)
+                ELSE 0
+            END), 0) AS overdue_total
+        FROM receivables
+        """
+    ) or []
+    if not rows:
+        return {"pending_total": 0.0, "received_total": 0.0, "overdue_total": 0.0}
+    return rows[0]
+
+
+def receive_installment(receivable_id: int, amount: float, payment_date: Optional[str] = None, note: Optional[str] = None) -> bool:
+    if not _table_exists("receivables"):
+        return False
+
+    amount = float(amount or 0)
+    if amount <= 0:
+        return False
+
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+
+        rows = run_query("SELECT * FROM receivables WHERE id = %s", (receivable_id,)) or []
+        if not rows:
+            return False
+        row = rows[0]
+        if row.get("status") == "paid":
+            return False
+
+        total = float(row.get("amount") or 0)
+        already_paid = float(row.get("paid_amount") or 0)
+        remaining = max(total - already_paid, 0)
+        if amount > remaining:
+            return False
+
+        new_paid = already_paid + amount
+        new_status = "paid" if new_paid >= total else "pending"
+
+        dt_val = payment_date if payment_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
+        dt_sql = ph if payment_date else dt_val
+
+        upd_q = (
+            f"UPDATE receivables SET paid_amount = {ph}, status = {ph}, paid_date = {dt_sql}, note = {ph} WHERE id = {ph}"
+        )
+        upd_note = note or row.get("note")
+        upd_params = (new_paid, new_status, payment_date, upd_note, receivable_id) if payment_date else (new_paid, new_status, upd_note, receivable_id)
+        cur.execute(upd_q, upd_params)
+
+        tx_q = (
+            f"INSERT INTO transactions (type, amount, category, description, date, product_id) "
+            f"VALUES ('Receita', {ph}, 'Venda', {ph}, {dt_sql}, {ph})"
+        )
+        tx_desc = f"Recebimento de venda a prazo (parcela {row.get('installment_no')}/{row.get('total_installments')})"
+        product_id = row.get("product_id")
+        tx_params = (amount, tx_desc, payment_date, product_id) if payment_date else (amount, tx_desc, product_id)
+        cur.execute(tx_q, tx_params)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Erro receive_installment: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        return False
+
+
 def create_sale(
     product_id: int,
     quantity: int,
@@ -319,7 +418,11 @@ def create_sale(
     company_id: Optional[int] = None,
     partner_id: Optional[int] = None,
     description: Optional[str] = None,
-    sale_date: Optional[str] = None
+    sale_date: Optional[str] = None,
+    payment_mode: str = "avista",
+    installments: int = 1,
+    upfront_amount: float = 0.0,
+    first_due_date: Optional[str] = None
 ) -> Optional[int]:
     conn = get_db_connection()
     if not conn:
@@ -330,11 +433,29 @@ def create_sale(
         avail = get_stock_level(product_id)
         if avail < qty_sold:
             raise Exception(f"Estoque insuficiente ({avail})")
-        
+
+        total = float(unit_price) * qty_sold
+        if total <= 0:
+            raise Exception("Valor total da venda inválido")
+
+        payment_mode = (payment_mode or "avista").lower()
+        if payment_mode not in ("avista", "parcelado", "aprazo"):
+            payment_mode = "avista"
+
+        upfront_amount = float(upfront_amount or 0)
+        upfront_amount = min(max(upfront_amount, 0), total)
+
+        if payment_mode == "avista":
+            upfront_amount = total
+            installments = 1
+        elif payment_mode == "aprazo":
+            installments = 1
+        else:
+            installments = max(int(installments or 1), 1)
+
         estimate = estimate_sale_cost(product_id, qty_sold)
         blended_unit_cost = float(estimate["estimated_unit_cost"])
 
-        # Consome custos adicionais pendentes para aumentar CMV das saídas.
         if _table_exists("product_cost_adjustments"):
             ph = "?" if DB_TYPE == "sqlite" else "%s"
             adjustments = _get_pending_cost_adjustments(product_id)
@@ -356,27 +477,61 @@ def create_sale(
             f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, unit_cost) VALUES ({ph}, {ph}, 'out', {ph}, {ph})",
             (product_id, qty_sold, description, blended_unit_cost)
         )
-        
-        total = float(unit_price) * qty_sold
+
         dt_val = sale_date if sale_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
         dt_sql = ph if sale_date else dt_val
-        q = f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) VALUES ('Receita', {ph}, 'Venda', {ph}, {dt_sql}, {ph}, {ph}, {ph})"
-        params = (total, description, sale_date, product_id, partner_id, company_id) if sale_date else (total, description, product_id, partner_id, company_id)
-        
-        if DB_TYPE == "postgres":
-            cur.execute(q + " RETURNING id", params)
-            tid = cur.fetchone()[0]
-        else:
-            cur.execute(q, params)
-            tid = cur.lastrowid
-            
+
+        tx_id = None
+        if upfront_amount > 0:
+            q = f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) VALUES ('Receita', {ph}, 'Venda', {ph}, {dt_sql}, {ph}, {ph}, {ph})"
+            recv_desc = (description or "Venda") + f" [{payment_mode}]"
+            params = (upfront_amount, recv_desc, sale_date, product_id, partner_id, company_id) if sale_date else (upfront_amount, recv_desc, product_id, partner_id, company_id)
+
+            if DB_TYPE == "postgres":
+                cur.execute(q + " RETURNING id", params)
+                tx_id = cur.fetchone()[0]
+            else:
+                cur.execute(q, params)
+                tx_id = cur.lastrowid
+
+        pending_amount = max(total - upfront_amount, 0)
+        if pending_amount > 0 and _table_exists("receivables"):
+            from datetime import datetime, timedelta
+            if first_due_date:
+                base_due = datetime.fromisoformat(str(first_due_date)).date()
+            elif sale_date:
+                base_due = datetime.fromisoformat(str(sale_date)).date()
+            else:
+                base_due = datetime.now().date()
+
+            inst_count = max(int(installments or 1), 1)
+            part_value = round(pending_amount / inst_count, 2)
+            values = [part_value] * inst_count
+            diff = round(pending_amount - sum(values), 2)
+            values[-1] = round(values[-1] + diff, 2)
+
+            for idx, value in enumerate(values, start=1):
+                if value <= 0:
+                    continue
+                due = base_due + timedelta(days=30 * (idx - 1))
+                r_q = (
+                    f"INSERT INTO receivables (product_id, sale_transaction_id, installment_no, total_installments, amount, due_date, status, paid_amount, note) "
+                    f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 'pending', 0, {ph})"
+                )
+                r_note = f"Venda a receber - parcela {idx}/{inst_count}. {description or ''}".strip()
+                cur.execute(r_q, (product_id, tx_id, idx, inst_count, value, str(due), r_note))
+
         conn.commit()
         cur.close()
         conn.close()
-        return tid
+        return tx_id if tx_id else -1
     except Exception as e:
         print(f"Erro create_sale: {e}")
         if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             conn.close()
         return None
 
@@ -886,8 +1041,8 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
     query = """
     SELECT 
         p.id, p.name, p.share_pct,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita' AND COALESCE(category,'') NOT IN (""" + NON_OPERATIONAL_SQL + """)) AS total_revenue,
-        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa' AND COALESCE(category,'') NOT IN (""" + PROFIT_EXPENSE_EXCLUSIONS_SQL + """)) AS total_expenses,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Receita' AND COALESCE(category,'') NOT IN (""" + NON_OPERATIONAL_SQL + """) AND """ + NON_OPERATIONAL_EXCLUSION_SQL + """) AS total_revenue,
+        (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='Despesa' AND COALESCE(category,'') NOT IN (""" + PROFIT_EXPENSE_EXCLUSIONS_SQL + """) AND """ + NON_OPERATIONAL_EXCLUSION_SQL + """) AS total_expenses,
         (SELECT COALESCE(SUM(c.amount), 0) FROM contributions c WHERE c.partner_id = p.id) AS total_contributed,
         (SELECT COALESCE(SUM(w.amount), 0) FROM withdrawals w WHERE w.partner_id = p.id) AS total_withdrawn
     FROM partners p
@@ -950,8 +1105,8 @@ def get_advanced_kpis(period: str = 'month'):
     
     # Receita e despesas do período
     q_period = f"""SELECT 
-        COALESCE(SUM(CASE WHEN type='Receita' AND COALESCE(category,'') NOT IN ({NON_OPERATIONAL_SQL}) THEN amount ELSE 0 END), 0) AS revenue,
-        COALESCE(SUM(CASE WHEN type='Despesa' AND COALESCE(category,'') NOT IN ({PROFIT_EXPENSE_EXCLUSIONS_SQL}) THEN amount ELSE 0 END), 0) AS expenses,
+        COALESCE(SUM(CASE WHEN type='Receita' AND COALESCE(category,'') NOT IN ({NON_OPERATIONAL_SQL}) AND {NON_OPERATIONAL_EXCLUSION_SQL} THEN amount ELSE 0 END), 0) AS revenue,
+        COALESCE(SUM(CASE WHEN type='Despesa' AND COALESCE(category,'') NOT IN ({PROFIT_EXPENSE_EXCLUSIONS_SQL}) AND {NON_OPERATIONAL_EXCLUSION_SQL} THEN amount ELSE 0 END), 0) AS expenses,
         COALESCE(SUM(CASE WHEN type='Despesa' AND COALESCE(category,'') IN ({INFRA_INVESTMENT_SQL}) THEN amount ELSE 0 END), 0) AS infra_investment
     FROM transactions WHERE {filter_sql}"""
     
@@ -1029,7 +1184,7 @@ def get_revenue_details():
     res = run_query(
         "SELECT CASE WHEN product_id IS NOT NULL THEN 'Venda' ELSE 'Servico' END as channel, SUM(amount) as total "
         "FROM transactions "
-        f"WHERE type = 'Receita' AND COALESCE(category,'') NOT IN ({NON_OPERATIONAL_SQL}) "
+        f"WHERE type = 'Receita' AND COALESCE(category,'') NOT IN ({NON_OPERATIONAL_SQL}) AND {NON_OPERATIONAL_EXCLUSION_SQL} "
         "GROUP BY channel"
     ) or []
     return res

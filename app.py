@@ -15,7 +15,8 @@ from db_helpers import (
     create_contribution, create_withdrawal, create_product_cost_adjustment,
     create_partner_loan, add_partner_loan_payment, get_partner_loans, get_partner_loans_summary,
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
-    create_fixed_expense, get_inventory_report, get_revenue_details, get_infra_inventory, get_accounts_receivable_summary,
+    get_receivables_summary, receive_installment, create_fixed_expense,
+    get_inventory_report, get_revenue_details, get_infra_inventory, get_accounts_receivable_summary,
     estimate_sale_cost,
     delete_history_item, get_all_transactions, get_detailed_stock_report,
     get_categories, create_category
@@ -107,7 +108,6 @@ with tab1:
                     
                     if "error" in ai_res:
                         st.error(ai_res["error"])
-                    else:
                         st.session_state.current_action = ai_res
                         reply = generate_ai_reply(ai_res)
                         st.session_state.messages.append({"role": "assistant", "content": reply})
@@ -295,23 +295,65 @@ with tab_manual:
                         f"em {int(saldo_resumo.get('total_open_titles', 0))} título(s)."
                     )
                 
-                if st.button("🚀 Registrar Venda", use_container_width=True):
-                    if modalidade_venda == "A prazo":
-                        res = create_credit_sale(
-                            p_id,
-                            qty_venda,
-                            preco_venda,
-                            due_date=str(due_date),
-                            customer_name=customer_name,
-                            description=desc_venda,
-                            sale_date=str(data_venda)
-                        )
-                    else:
-                        res = create_sale(p_id, qty_venda, preco_venda, description=desc_venda, sale_date=str(data_venda))
+                st.divider()
+                cond_pag = st.radio(
+                    "Forma de recebimento",
+                    options=["À vista", "Parcelado", "A prazo (fiado)"],
+                    horizontal=True,
+                    help="À vista: entra no caixa agora. Parcelado/A prazo: registra contas a receber."
+                )
+                parcelas = 1
+                entrada = total_venda
+                primeira_parcela = data_venda
 
-                    if res:
-                        venda_label = "venda a prazo" if modalidade_venda == "A prazo" else "venda"
-                        st.success(f"✅ {venda_label.capitalize()} de R$ {total_venda:.2f} registrada!")
+                if cond_pag == "Parcelado":
+                    col_p1, col_p2 = st.columns(2)
+                    parcelas = col_p1.number_input("Qtd. parcelas", min_value=2, max_value=24, value=2, step=1)
+                    entrada = col_p2.number_input(
+                        "Entrada recebida agora (R$)",
+                        min_value=0.0,
+                        max_value=float(total_venda),
+                        value=0.0,
+                        step=0.01
+                    )
+                    primeira_parcela = st.date_input("1º vencimento", value=data_venda, key="primeira_parcela")
+                elif cond_pag == "A prazo (fiado)":
+                    col_ap1, col_ap2 = st.columns(2)
+                    entrada = col_ap1.number_input(
+                        "Valor recebido agora (R$)",
+                        min_value=0.0,
+                        max_value=float(total_venda),
+                        value=0.0,
+                        step=0.01,
+                        help="Se recebeu uma parte, informe aqui. O restante ficará pendente."
+                    )
+                    primeira_parcela = col_ap2.date_input("Vencimento", value=data_venda, key="venc_aprazo")
+
+                if st.button("🚀 Registrar Venda", use_container_width=True):
+
+                    modo = "avista"
+                    if cond_pag == "Parcelado":
+                        modo = "parcelado"
+                    elif cond_pag == "A prazo (fiado)" or modalidade_venda == "A prazo":
+                        modo = "aprazo"
+
+                    res = create_sale(
+                        p_id,
+                        qty_venda,
+                        preco_venda,
+                        description=desc_venda,
+                        sale_date=str(data_venda),
+                        payment_mode=modo,
+                        installments=int(parcelas),
+                        upfront_amount=float(entrada),
+                        first_due_date=str(primeira_parcela)
+                    )
+                    if res is not None:
+                        pendente = max(float(total_venda) - float(entrada), 0)
+                        if pendente > 0:
+                            st.success(f"✅ Venda registrada! Recebido agora: R$ {float(entrada):.2f} | A receber: R$ {pendente:.2f}")
+                        else:
+                            st.success(f"✅ Venda de R$ {total_venda:.2f} registrada à vista!")
                         st.rerun()
                     else:
                         st.error("Erro ao registrar venda. Verifique o estoque disponível e os dados informados.")
@@ -364,6 +406,32 @@ with tab_manual:
             st.info("Nenhuma venda a prazo em aberto no momento.")
 
     with sub_tab2:
+        st.subheader("Receber Vendas a Prazo")
+        receivables_rows = run_query(
+            "SELECT id, installment_no, total_installments, amount, paid_amount, due_date, note FROM receivables WHERE status='pending' ORDER BY due_date, id"
+        ) or []
+        if receivables_rows:
+            recibo_op = {
+                f"#{r['id']} | Parcela {r['installment_no']}/{r['total_installments']} | Venc: {r['due_date']} | Pendente: R$ {float(r['amount']) - float(r.get('paid_amount') or 0):.2f}": r
+                for r in receivables_rows
+            }
+            sel_rec = st.selectbox("Parcela pendente", options=list(recibo_op.keys()))
+            rec_obj = recibo_op[sel_rec]
+            rec_pendente = max(float(rec_obj['amount']) - float(rec_obj.get('paid_amount') or 0), 0.0)
+            col_rr1, col_rr2 = st.columns(2)
+            valor_receb = col_rr1.number_input("Valor recebido desta parcela (R$)", min_value=0.01, max_value=float(rec_pendente), value=float(rec_pendente), step=0.01)
+            data_receb = col_rr2.date_input("Data do recebimento", value=date.today(), key="dt_receb_parcela")
+            if st.button("💸 Dar baixa / receber", use_container_width=True):
+                ok = receive_installment(int(rec_obj['id']), float(valor_receb), payment_date=str(data_receb), note="Recebimento manual")
+                if ok:
+                    st.success("Recebimento lançado com sucesso.")
+                    st.rerun()
+                else:
+                    st.error("Não foi possível registrar o recebimento da parcela.")
+        else:
+            st.info("Nenhuma venda pendente para receber.")
+
+        st.divider()
         st.subheader("Nova Receita ou Despesa")
         tipo_f = st.radio("Tipo", ["Receita", "Despesa"], horizontal=True)
         valor_f = st.number_input("Valor (R$)", min_value=0.01, step=0.01)
@@ -559,6 +627,7 @@ with tab2:
     rev_details = get_revenue_details()
     infra_inventory = get_infra_inventory()
     receivable_summary = get_accounts_receivable_summary()
+    receivables = get_receivables_summary()
     partner_capital_row = run_query("SELECT COALESCE(SUM(amount), 0) AS total FROM contributions")
     # Mostramos o valor de VENDA total no dashboard (é o potencial de receita parada)
     total_inv_sale = sum([item.get('total_sale_value', 0) for item in inv_data]) if inv_data else 0
@@ -579,6 +648,7 @@ with tab2:
         bottom_1, bottom_2, bottom_3, bottom_4 = st.columns(4)
         bottom_1.metric("🏗️ Invest. em Infra", f"R$ {float(k.get('infra_investment', 0)):.2f}", delta_color="inverse")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
+        saldo_real = float(k.get('total_cash', 0)) + float(receivables.get('pending_total', 0) or 0)
         bottom_3.metric("💰 Saldo em Caixa", f"R$ {float(k.get('total_cash', 0)):.2f}")
         bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
     else:
@@ -591,6 +661,7 @@ with tab2:
         bottom_1, bottom_2, bottom_3, bottom_4 = st.columns(4)
         bottom_1.metric("🏗️ Invest. em Infra", "R$ 0.00")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
+        saldo_real = float(receivables.get('pending_total', 0) or 0)
         bottom_3.metric("💰 Saldo em Caixa", "R$ 0.00")
         bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
 
@@ -601,7 +672,6 @@ with tab2:
 
     st.caption("Capital Investido = infraestrutura acumulada + estoque atual a custo. Aportes dos Sócios ficam separados porque são a origem do capital, não a aplicação dele.")
     st.caption("Saldo em Caixa não inclui vendas a prazo ainda não recebidas. O card 'A Prazo a Receber' mostra exatamente o que ainda falta entrar.")
-
     # Alertas
     alerts = get_upcoming_alerts()
     if alerts:
