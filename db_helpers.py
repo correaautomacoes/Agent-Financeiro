@@ -210,7 +210,7 @@ def get_products(company_id: Optional[int] = None) -> List[Dict[str, Any]]:
         res = run_query("SELECT * FROM products ORDER BY id DESC")
     return res or []
 
-def add_stock_movement(product_id: int, quantity: int, movement_type: str, reference: Optional[str] = None, source: str = 'próprio', is_paid: bool = False, unit_cost: float = 0.0) -> Optional[int]:
+def add_stock_movement(product_id: int, quantity: int, movement_type: str, reference: Optional[str] = None, source: str = 'próprio', is_paid: bool = False, unit_cost: float = 0.0, movement_date: Optional[str] = None, record_expense: bool = True) -> Optional[int]:
     conn = get_db_connection()
     if not conn:
         return None
@@ -236,12 +236,32 @@ def add_stock_movement(product_id: int, quantity: int, movement_type: str, refer
         else:
             cur.execute(query, (product_id, qty, movement_type, reference, source, is_paid, unit_cost))
             mid = cur.lastrowid
-        
-        if movement_type == 'in' and is_paid and unit_cost > 0:
+
+        if movement_type == 'in' and is_paid and unit_cost > 0 and record_expense:
             total_cost = unit_cost * qty
-            dt = "CURRENT_DATE" if DB_TYPE == "postgres" else "date('now')"
-            cur.execute(f"INSERT INTO transactions (type, amount, category, description, date, product_id) VALUES ('Despesa', {ph}, 'Estoque/Compra', {ph}, {dt}, {ph})", (total_cost, f"Compra: {reference}", product_id))
-            
+
+            if movement_date:
+                if DB_TYPE == 'postgres':
+                    date_expr = '%s'
+                    tx_date_val = movement_date
+                else:
+                    date_expr = '?'
+                    tx_date_val = movement_date
+            else:
+                date_expr = "CURRENT_DATE" if DB_TYPE == "postgres" else "date('now')"
+                tx_date_val = None
+
+            if date_expr in ('CURRENT_DATE', "date('now')"):
+                cur.execute(
+                    f"INSERT INTO transactions (type, amount, category, description, date, product_id) VALUES ('Despesa', {ph}, 'Estoque/Compra', {ph}, {date_expr}, {ph})",
+                    (total_cost, f"Compra: {reference}", product_id)
+                )
+            else:
+                cur.execute(
+                    f"INSERT INTO transactions (type, amount, category, description, date, product_id) VALUES ('Despesa', {ph}, 'Estoque/Compra', {ph}, {date_expr}, {ph})",
+                    (total_cost, f"Compra: {reference}", tx_date_val, product_id)
+                )
+
         conn.commit()
         cur.close()
         conn.close()

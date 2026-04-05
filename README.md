@@ -2,27 +2,79 @@
 
 Este projeto é um assistente financeiro que permite registrar despesas e receitas via chat, utilizando IA (Gemini) para entender o que você escreve e salvando tudo em um banco de dados SQL.
 
-## 🚀 Como Rodar Localmente (Windows)
+## 🚀 Como Rodar Localmente (RÁPIDO)
 
-O sistema foi preparado para ser instalado com apenas alguns cliques.
+### Setup Automático (Cross-Platform - Windows/Linux/macOS)
 
-### 1. Pré-requisitos
-- **Windows 10 ou 11**.
-- **Python 3.10+** (Certifique-se de marcar "Add Python to PATH").
-- **Docker Desktop** instalado e rodando (Para o Banco de Dados).
+**Windows:**
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
 
-### 2. Instalação e Configuração
-1.  Execute o arquivo **`instalar_windows.bat`** com um duplo clique.
-2.  O instalador irá:
-    - Criar o ambiente isolado (venv).
-    - Instalar todas as dependências.
-    - Solicitar sua **GEMINI_API_KEY** (Cole sua chave e dê Enter).
-    - Iniciar o banco de dados via Docker.
-    - Criar um **atalho na área de trabalho** chamado "Agente Financeiro".
+**Linux/macOS:**
+```bash
+bash setup.sh
+```
 
-### 3. Acesso
-- Após a instalação, basta usar o atalho na sua Área de Trabalho ou rodar o arquivo **`run_app.bat`**.
-- O sistema abrirá automaticamente no seu navegador.
+Ou execute o Python diretamente em qualquer sistema:
+```bash
+python setup.py
+```
+
+### O que o Setup Faz Automaticamente
+✅ Verifica/instala Python 3.10+  
+✅ Cria virtual environment isolado  
+✅ Instala todas as dependências  
+✅ **Detecta e oferece restaurar seus backup anteriores**  
+✅ Configura arquivo `.env`  
+✅ Inicializa banco de dados  
+✅ Cria scripts de inicialização  
+
+### Pré-requisitos Mínimos
+- **Python 3.10+** (https://www.python.org)
+- **Git** (opcional, para clonar o repositório)
+- **Google Gemini API Key** (gratuita em https://aistudio.google.com/app/apikeys)
+
+### Após Instalação
+1. Atualize seu `.env` com a GEMINI_API_KEY
+2. Execute `run.bat` (Windows) ou `./run.sh` (Linux/macOS)
+3. Acesse em: http://localhost:8502
+
+---
+
+## 📱 Migração entre Computadores
+
+O processo agora é **completamente automatizado**! 
+
+### Passo a Passo:
+1. **Clone o repositório no novo computador:**
+   ```bash
+   git clone https://github.com/seu-usuario/Agent-Financeiro.git
+   cd Agent-Financeiro
+   ```
+
+2. **Execute o setup:**
+   ```powershell
+   # Windows
+   powershell -ExecutionPolicy Bypass -File setup.ps1
+   ```
+   ```bash
+   # Linux/macOS
+   bash setup.sh
+   ```
+
+3. **O setup automaticamente detectará seus backups** e oferecerá restaurar!
+
+### Gerenciador de Backups
+Para gerenciar backups manualmente:
+```bash
+python backup_manager.py --interactive
+python backup_manager.py --create --desc "Backup antes de atualização"
+python backup_manager.py --list
+python backup_manager.py --restore "backups/20260403_xxxxxx_backup_lite_xxxxxx.db"
+```
+
+---
 
 ## 🛠 Tecnologias
 -   **Python 3.10+**

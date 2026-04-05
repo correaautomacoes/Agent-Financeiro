@@ -1305,6 +1305,16 @@ with tab4:
             st.markdown("**Saldos em Aberto por Sócio**")
             sum_df = pd.DataFrame(summary)
             sum_df.columns = ["ID Sócio", "Sócio", "Empresa Deve ao Sócio", "Sócio Deve à Empresa"]
+
+            total_company_owes = float(sum_df['Empresa Deve ao Sócio'].astype(float).sum())
+            total_partner_owes = float(sum_df['Sócio Deve à Empresa'].astype(float).sum())
+            net_loan_balance = total_company_owes - total_partner_owes
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Empresa Deve ao Sócio", f"R$ {total_company_owes:,.2f}")
+            c2.metric("Total Sócio Deve à Empresa", f"R$ {total_partner_owes:,.2f}")
+            c3.metric("Balanço Líquido de Empréstimos", f"R$ {net_loan_balance:,.2f}", delta_color="normal")
+
             st.dataframe(
                 sum_df.style.format({
                     "Empresa Deve ao Sócio": "R$ {:.2f}",
@@ -1313,6 +1323,16 @@ with tab4:
                 use_container_width=True,
                 hide_index=True
             )
+
+            st.markdown("**Ações Rápidas**")
+            r1, r2 = st.columns([3, 1])
+            if r1.button("Registrar novo empréstimo (sócio↔empresa)", key="quick_new_loan"):
+                st.experimental_set_query_params(section="emprestimos")
+                st.info("Use o formulário acima para registrar o empréstimo.")
+            if r2.button("Ver relatório detalhado", key="quick_loan_report"):
+                st.write("Use o painel Dashboard para análises em tempo real ou texto do histórico de empréstimos.")
+        else:
+            st.info("Não há registros de empréstimos ainda.")
     else:
         st.info("Cadastre um sócio para registrar empréstimos.")
 
