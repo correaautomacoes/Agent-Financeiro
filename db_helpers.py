@@ -189,6 +189,17 @@ def get_partners(company_id: Optional[int] = None) -> List[Dict[str, Any]]:
         res = run_query("SELECT * FROM partners ORDER BY id DESC")
     return res or []
 
+
+def update_partner_share(partner_id: int, share_pct: float) -> bool:
+    try:
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        query = f"UPDATE partners SET share_pct = {ph} WHERE id = {ph}"
+        result = run_query(query, (share_pct, partner_id))
+        return result is not None
+    except Exception as e:
+        print(f"Erro update_partner_share: {e}")
+        return False
+
 def create_product(company_id: int, name: str, price: float = 0.0, sku: Optional[str] = None) -> Optional[int]:
     conn = get_db_connection()
     if not conn:
@@ -1145,6 +1156,7 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
         (SELECT COALESCE(SUM(c.amount), 0) FROM contributions c WHERE c.partner_id = p.id) AS total_contributed,
         (SELECT COALESCE(SUM(w.amount), 0) FROM withdrawals w WHERE w.partner_id = p.id) AS total_withdrawn
     FROM partners p
+    WHERE COALESCE(p.share_pct, 0) > 0
     """
     if company_id:
         query += " WHERE p.company_id = %s"
@@ -1165,6 +1177,12 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
             "SELECT COALESCE(SUM(total_amount - received_amount), 0) AS total FROM accounts_receivable WHERE (total_amount - received_amount) > 0"
         ) or []
         receivable_open_total = float(receivable_rows[0].get("total", 0) or 0) if receivable_rows else 0.0
+
+    if _table_exists("receivables"):
+        legacy_receivables = run_query(
+            "SELECT COALESCE(SUM(amount - COALESCE(paid_amount, 0)), 0) AS total FROM receivables WHERE status != 'paid'"
+        ) or []
+        receivable_open_total += float(legacy_receivables[0].get("total", 0) or 0) if legacy_receivables else 0.0
     
     for r in res:
         # Lucro real = Receita - Despesas - CMV

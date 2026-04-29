@@ -7,7 +7,7 @@ from database import run_query, save_transactions_batch, init_db
 from ai_agent import process_chat_command, generate_ai_reply, process_statement, set_api_key_permanent
 from db_helpers import (
     create_company, get_companies,
-    create_partner, get_partners,
+    create_partner, get_partners, update_partner_share,
     create_product, get_products,
     add_stock_movement, get_stock_level,
     get_expense_types, get_income_types,
@@ -1135,10 +1135,11 @@ with tab4:
 
     st.divider()
     st.subheader("Sócios / Parceiros")
+    st.caption("Use participação 0 para parceiros ou comissões sem direito à divisão de lucros.")
     companies_select = {c['name']: c['id'] for c in companies} if companies else {}
     comp_option = st.selectbox("Empresa", options=["-"] + list(companies_select.keys()), key="partner_company")
-    pname = st.text_input("Nome do sócio", key="partner_name")
-    pshare = st.number_input("Porcentagem de participação (%)", min_value=0.0, max_value=100.0, step=0.1, key="partner_share")
+    pname = st.text_input("Nome do sócio / parceiro", key="partner_name")
+    pshare = st.number_input("Porcentagem de participação (%)", min_value=0.0, max_value=100.0, step=0.1, key="partner_share", help="Defina 0 para comissão ou parceria sem participação nos lucros.")
     if st.button("➕ Adicionar Sócio"):
         if comp_option and comp_option != "-":
             pid = create_partner(companies_select[comp_option], pname, pshare)
@@ -1151,6 +1152,45 @@ with tab4:
 
     partners = get_partners(companies_select.get(comp_option) if comp_option != "-" else None)
     if partners:
+        st.subheader("Editar Sócio / Parceiro")
+        partner_select_options = {f"{p['name']} ({p['share_pct']}%)": p['id'] for p in partners}
+        selected_partner_label = st.selectbox("Selecione um sócio para editar", options=["-"] + list(partner_select_options.keys()), key="edit_partner_select")
+        if selected_partner_label != "-":
+            selected_partner_id = partner_select_options[selected_partner_label]
+            selected_partner = next((p for p in partners if p['id'] == selected_partner_id), None)
+            if selected_partner:
+                updated_share = st.number_input(
+                    "Porcentagem de participação (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.1,
+                    value=float(selected_partner['share_pct']),
+                    key="edit_partner_share"
+                )
+                if st.button("💾 Atualizar participação", key="update_partner_share"):
+                    success = update_partner_share(selected_partner_id, updated_share)
+                    if success:
+                        st.success("Participação atualizada com sucesso.")
+                        st.rerun()
+                    else:
+                        st.error("Erro ao atualizar a participação.")
+
+                if st.button("🔧 Definir participação para 70%", key="set_partner_70"):
+                    success = update_partner_share(selected_partner_id, 70.0)
+                    if success:
+                        st.success("Participação atualizada para 70%.")
+                        st.rerun()
+                    else:
+                        st.error("Erro ao atualizar a participação.")
+
+                if updated_share != 0.0 and st.button("🔁 Marcar como parceiro de comissão (0%)", key="convert_to_commission_partner"):
+                    success = update_partner_share(selected_partner_id, 0.0)
+                    if success:
+                        st.success("Sócio convertido para parceiro de comissão.")
+                        st.rerun()
+                    else:
+                        st.error("Erro ao atualizar o sócio.")
+
         st.write("Sócios:")
         st.dataframe(pd.DataFrame(partners), use_container_width=True)
 
