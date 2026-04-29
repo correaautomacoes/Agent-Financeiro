@@ -1,5 +1,6 @@
 from typing import Optional, List, Dict, Any
 import os
+from datetime import date, datetime
 from database import get_db_connection, run_query
 
 DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
@@ -21,6 +22,15 @@ def _sql_quote(value: str) -> str:
 
 def _sql_in_list(values: tuple[str, ...]) -> str:
     return ", ".join(_sql_quote(v) for v in values)
+
+
+def _parse_iso_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)).date()
+    except Exception:
+        return None
 
 
 NON_OPERATIONAL_SQL = _sql_in_list(NON_OPERATIONAL_CATEGORIES)
@@ -502,9 +512,10 @@ def create_sale(
         dt_sql = ph if sale_date else dt_val
 
         tx_id = None
+        recv_desc = (description or "Venda") + f" [{payment_mode}]"
+        revenue_category = "Venda" if payment_mode == "avista" else "Venda a Prazo"
         if upfront_amount > 0:
-            q = f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) VALUES ('Receita', {ph}, 'Venda', {ph}, {dt_sql}, {ph}, {ph}, {ph})"
-            recv_desc = (description or "Venda") + f" [{payment_mode}]"
+            q = f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) VALUES ('Receita', {ph}, '{revenue_category}', {ph}, {dt_sql}, {ph}, {ph}, {ph})"
             params = (upfront_amount, recv_desc, sale_date, product_id, partner_id, company_id) if sale_date else (upfront_amount, recv_desc, product_id, partner_id, company_id)
 
             if DB_TYPE == "postgres":
@@ -515,31 +526,62 @@ def create_sale(
                 tx_id = cur.lastrowid
 
         pending_amount = max(total - upfront_amount, 0)
-        if pending_amount > 0 and _table_exists("receivables"):
-            from datetime import datetime, timedelta
-            if first_due_date:
-                base_due = datetime.fromisoformat(str(first_due_date)).date()
-            elif sale_date:
-                base_due = datetime.fromisoformat(str(sale_date)).date()
-            else:
-                base_due = datetime.now().date()
-
-            inst_count = max(int(installments or 1), 1)
-            part_value = round(pending_amount / inst_count, 2)
-            values = [part_value] * inst_count
-            diff = round(pending_amount - sum(values), 2)
-            values[-1] = round(values[-1] + diff, 2)
-
-            for idx, value in enumerate(values, start=1):
-                if value <= 0:
-                    continue
-                due = base_due + timedelta(days=30 * (idx - 1))
-                r_q = (
-                    f"INSERT INTO receivables (product_id, sale_transaction_id, installment_no, total_installments, amount, due_date, status, paid_amount, note) "
-                    f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 'pending', 0, {ph})"
+        if pending_amount > 0:
+            due_date_value = first_due_date or sale_date
+            if _table_exists("accounts_receivable"):
+                ar_q = (
+                    f"INSERT INTO accounts_receivable "
+                    f"(product_id, partner_id, company_id, customer_name, description, quantity, unit_price, total_amount, received_amount, sale_date, due_date, status) "
+                    f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 0, {dt_sql}, {ph}, 'open')"
                 )
-                r_note = f"Venda a receber - parcela {idx}/{inst_count}. {description or ''}".strip()
-                cur.execute(r_q, (product_id, tx_id, idx, inst_count, value, str(due), r_note))
+                ar_params = (
+                    product_id,
+                    partner_id,
+                    company_id,
+                    None,
+                    recv_desc,
+                    qty_sold,
+                    float(unit_price),
+                    pending_amount,
+                    sale_date,
+                    due_date_value,
+                ) if sale_date else (
+                    product_id,
+                    partner_id,
+                    company_id,
+                    None,
+                    recv_desc,
+                    qty_sold,
+                    float(unit_price),
+                    pending_amount,
+                    due_date_value,
+                )
+                cur.execute(ar_q, ar_params)
+            elif _table_exists("receivables"):
+                from datetime import datetime, timedelta
+                if first_due_date:
+                    base_due = datetime.fromisoformat(str(first_due_date)).date()
+                elif sale_date:
+                    base_due = datetime.fromisoformat(str(sale_date)).date()
+                else:
+                    base_due = datetime.now().date()
+
+                inst_count = max(int(installments or 1), 1)
+                part_value = round(pending_amount / inst_count, 2)
+                values = [part_value] * inst_count
+                diff = round(pending_amount - sum(values), 2)
+                values[-1] = round(values[-1] + diff, 2)
+
+                for idx, value in enumerate(values, start=1):
+                    if value <= 0:
+                        continue
+                    due = base_due + timedelta(days=30 * (idx - 1))
+                    r_q = (
+                        f"INSERT INTO receivables (product_id, sale_transaction_id, installment_no, total_installments, amount, due_date, status, paid_amount, note) "
+                        f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 'pending', 0, {ph})"
+                    )
+                    r_note = f"Venda a receber - parcela {idx}/{inst_count}. {description or ''}".strip()
+                    cur.execute(r_q, (product_id, tx_id, idx, inst_count, value, str(due), r_note))
 
         conn.commit()
         cur.close()
@@ -739,7 +781,7 @@ def add_receivable_payment(
 
 
 def get_accounts_receivable_summary() -> Dict[str, Any]:
-    if not _table_exists("accounts_receivable"):
+    if not _table_exists("accounts_receivable") and not _table_exists("receivables"):
         return {
             "open_amount": 0.0,
             "overdue_amount": 0.0,
@@ -747,42 +789,79 @@ def get_accounts_receivable_summary() -> Dict[str, Any]:
             "items": [],
         }
 
-    outstanding_expr = "(ar.total_amount - ar.received_amount)"
-    if DB_TYPE == "postgres":
-        overdue_sql = f"CASE WHEN ar.due_date IS NOT NULL AND ar.due_date < CURRENT_DATE THEN {outstanding_expr} ELSE 0 END"
-    else:
-        overdue_sql = f"CASE WHEN ar.due_date IS NOT NULL AND ar.due_date < date('now') THEN {outstanding_expr} ELSE 0 END"
+    items: List[Dict[str, Any]] = []
+    if _table_exists("accounts_receivable"):
+        outstanding_expr = "(ar.total_amount - ar.received_amount)"
+        if DB_TYPE == "postgres":
+            overdue_sql = f"CASE WHEN ar.due_date IS NOT NULL AND ar.due_date < CURRENT_DATE THEN {outstanding_expr} ELSE 0 END"
+        else:
+            overdue_sql = f"CASE WHEN ar.due_date IS NOT NULL AND ar.due_date < date('now') THEN {outstanding_expr} ELSE 0 END"
 
-    query = f"""
-    SELECT
-        ar.id,
-        ar.customer_name,
-        ar.description,
-        ar.quantity,
-        ar.unit_price,
-        ar.total_amount,
-        ar.received_amount,
-        {outstanding_expr} AS outstanding_amount,
-        ar.sale_date,
-        ar.due_date,
-        ar.status,
-        p.name AS product_name,
-        {overdue_sql} AS overdue_amount
-    FROM accounts_receivable ar
-    LEFT JOIN products p ON p.id = ar.product_id
-    WHERE (ar.total_amount - ar.received_amount) > 0
-    ORDER BY
-        CASE WHEN ar.due_date IS NULL THEN 1 ELSE 0 END,
-        ar.due_date ASC,
-        ar.id DESC
-    """
-    items = run_query(query) or []
-    for item in items:
-        item["outstanding_amount"] = float(item.get("outstanding_amount") or 0)
-        item["overdue_amount"] = float(item.get("overdue_amount") or 0)
-        item["received_amount"] = float(item.get("received_amount") or 0)
-        item["total_amount"] = float(item.get("total_amount") or 0)
-        item["unit_price"] = float(item.get("unit_price") or 0)
+        query = f"""
+        SELECT
+            ar.id,
+            ar.customer_name,
+            ar.description,
+            ar.quantity,
+            ar.unit_price,
+            ar.total_amount,
+            ar.received_amount,
+            {outstanding_expr} AS outstanding_amount,
+            ar.sale_date,
+            ar.due_date,
+            ar.status,
+            p.name AS product_name,
+            {overdue_sql} AS overdue_amount
+        FROM accounts_receivable ar
+        LEFT JOIN products p ON p.id = ar.product_id
+        WHERE (ar.total_amount - ar.received_amount) > 0
+        ORDER BY
+            CASE WHEN ar.due_date IS NULL THEN 1 ELSE 0 END,
+            ar.due_date ASC,
+            ar.id DESC
+        """
+        items = run_query(query) or []
+        for item in items:
+            item["outstanding_amount"] = float(item.get("outstanding_amount") or 0)
+            item["overdue_amount"] = float(item.get("overdue_amount") or 0)
+            item["received_amount"] = float(item.get("received_amount") or 0)
+            item["total_amount"] = float(item.get("total_amount") or 0)
+            item["unit_price"] = float(item.get("unit_price") or 0)
+            item["legacy_source"] = None
+
+    if _table_exists("receivables"):
+        legacy_query = f"""
+        SELECT
+            r.id,
+            r.product_id,
+            NULL AS partner_id,
+            NULL AS company_id,
+            NULL AS customer_name,
+            r.note AS description,
+            1 AS quantity,
+            r.amount AS unit_price,
+            r.amount AS total_amount,
+            COALESCE(r.paid_amount, 0) AS received_amount,
+            t.date AS sale_date,
+            r.due_date,
+            r.status,
+            p.name AS product_name
+        FROM receivables r
+        LEFT JOIN transactions t ON t.id = r.sale_transaction_id
+        LEFT JOIN products p ON p.id = r.product_id
+        WHERE r.status != 'paid'
+        """
+        legacy_items = run_query(legacy_query) or []
+        today = date.today()
+        for item in legacy_items:
+            item["total_amount"] = float(item.get("total_amount") or 0)
+            item["received_amount"] = float(item.get("received_amount") or 0)
+            item["outstanding_amount"] = item["total_amount"] - item["received_amount"]
+            due_date = _parse_iso_date(item.get("due_date"))
+            item["overdue_amount"] = item["outstanding_amount"] if due_date and due_date < today else 0.0
+            item["unit_price"] = float(item.get("unit_price") or 0)
+            item["legacy_source"] = "receivables"
+            items.append(item)
 
     return {
         "open_amount": sum(item["outstanding_amount"] for item in items),

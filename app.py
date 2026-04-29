@@ -364,7 +364,7 @@ with tab_manual:
         open_titles = receivable_summary.get("items", [])
         if open_titles:
             receivable_options = {
-                f"#{item['id']} | {item.get('product_name') or 'Produto'} | Cliente: {item.get('customer_name') or 'Não informado'} | "
+                f"[{ 'LEG' if item.get('legacy_source') == 'receivables' else 'AR' }] #{item['id']} | {item.get('product_name') or 'Produto'} | Cliente: {item.get('customer_name') or 'Não informado'} | "
                 f"Saldo: R$ {float(item.get('outstanding_amount') or 0):.2f} | Vence: {item.get('due_date') or 'Sem vencimento'}": item
                 for item in open_titles
             }
@@ -391,12 +391,20 @@ with tab_manual:
             payment_note = col_r3.text_input("Nota", placeholder="Ex: Pix recebido", key="receivable_payment_note")
 
             if st.button("💸 Registrar Recebimento", use_container_width=True):
-                payment_id = add_receivable_payment(
-                    int(selected_receivable["id"]),
-                    payment_amount,
-                    payment_date=str(payment_date),
-                    note=payment_note
-                )
+                if selected_receivable.get("legacy_source") == "receivables":
+                    payment_id = receive_installment(
+                        int(selected_receivable["id"]),
+                        payment_amount,
+                        payment_date=str(payment_date),
+                        note=payment_note
+                    )
+                else:
+                    payment_id = add_receivable_payment(
+                        int(selected_receivable["id"]),
+                        payment_amount,
+                        payment_date=str(payment_date),
+                        note=payment_note
+                    )
                 if payment_id:
                     st.success("Recebimento registrado com sucesso!")
                     st.rerun()
