@@ -10,7 +10,7 @@ NON_OPERATIONAL_CATEGORIES = (
     "Amortiza\u00e7\u00e3o Empr\u00e9stimo",
     "Estoque/Compra",
     "Estoque/Custo Adicional",
-    "Recebimento Venda a Prazo",
+    "Venda a Prazo",
 )
 INFRA_INVESTMENT_CATEGORIES = ("Infraestrutura", "Software/Infra")
 
