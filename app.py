@@ -30,14 +30,14 @@ from db_helpers import (
 from backup_utils import export_backup, import_backup
 import os
 
+st.set_page_config(page_title="Agente Financeiro", page_icon="💰", layout="wide")
+
 # ... (sidebar debug code) ...
 
 # Garante criação/migração de tabelas na primeira execução da sessão.
 if "db_initialized" not in st.session_state:
     init_db()
     st.session_state.db_initialized = True
-
-st.set_page_config(page_title="Agente Financeiro", page_icon="💰", layout="wide")
 
 st.title("💰 Agente Financeiro Inteligente")
 
