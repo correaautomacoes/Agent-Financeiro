@@ -3,6 +3,12 @@ import pandas as pd
 from datetime import date
 import plotly.express as px
 import io
+from dotenv import load_dotenv
+from pathlib import Path
+
+dotenv_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=dotenv_path, override=True)
+
 from database import run_query, save_transactions_batch, init_db
 from ai_agent import process_chat_command, generate_ai_reply, process_statement, set_api_key_permanent
 from db_helpers import (
@@ -23,8 +29,6 @@ from db_helpers import (
 )
 from backup_utils import export_backup, import_backup
 import os
-from dotenv import load_dotenv
-load_dotenv(override=True)
 
 # ... (sidebar debug code) ...
 

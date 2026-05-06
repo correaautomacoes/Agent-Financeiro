@@ -22,6 +22,23 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
+"%PYTHON%" -m streamlit --version >nul 2>&1
+if %errorlevel% neq 0 (
+    if exist "%~dp0python311\python.exe" (
+        set "PYTHON=%~dp0python311\python.exe"
+        echo [INFO] Usando python311\python.exe porque streamlit nao esta no venv.
+    )
+)
+
+"%PYTHON%" --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERRO] Python nao encontrado.
+    echo Instale o Python 3.10+ ou crie o ambiente virtual com:
+    echo     python -m venv venv
+    pause
+    exit /b
+)
+
 set "STREAMLIT_BROWSER_GATHER_USAGE_STATS=false"
 set "USERPROFILE=%cd%"
 set "HOME=%cd%"

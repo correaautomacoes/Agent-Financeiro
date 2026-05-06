@@ -1192,10 +1192,10 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
         r['share_of_profit'] = lucro_real * share_ratio
         # Parte do lucro ainda "presa" em vendas a prazo abertas.
         r['pending_receivable_balance'] = receivable_open_total * share_ratio
-        # Saldo teórico total = lucro + aportes - retiradas.
-        r['current_balance'] = r['share_of_profit'] + float(r['total_contributed']) - float(r['total_withdrawn'])
-        # Saldo disponível = saldo total menos a fatia ainda não recebida do contas a receber.
-        r['available_balance'] = r['current_balance'] - r['pending_receivable_balance']
+        # Saldo teórico de capital do sócio = aportes menos retiradas.
+        r['capital_balance'] = float(r['total_contributed']) - float(r['total_withdrawn'])
+        # Saldo disponível de lucro = lucro gerado menos o que ainda está a prazo e o que já foi retirado.
+        r['available_balance'] = r['share_of_profit'] - r['pending_receivable_balance'] - float(r['total_withdrawn'])
     return res
 
 def get_advanced_kpis(period: str = 'month'):

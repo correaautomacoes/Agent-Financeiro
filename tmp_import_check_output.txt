@@ -1,0 +1,1 @@
+[{'id': 1, 'name': 'Mateus Correa', 'share_pct': 70, 'total_revenue': 26465.58, 'total_expenses': 1521.27, 'total_contributed': 2213.67, 'total_withdrawn': 6022.95, 'share_of_profit': 6872.117, 'pending_receivable_balance': 1301.3, 'capital_balance': -3809.2799999999997, 'available_balance': -452.1329999999998}]

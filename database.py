@@ -3,11 +3,14 @@ import sqlite3
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv(override=True)
+dotenv_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=dotenv_path, override=True)
 
 # Configuração de Tipo de Banco (sqlite ou postgres)
 DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
+print(f"[DEBUG] database.py loaded DB_TYPE={DB_TYPE}, SQLITE_PATH={os.getenv('SQLITE_PATH', 'financeiro.db')}")
 
 # Configurações Postgres
 DB_HOST = os.getenv("DB_HOST", "postgres")
