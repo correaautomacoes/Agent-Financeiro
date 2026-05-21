@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="/home/matt/Documentos/Agente FInanceiro/Agent-Financeiro"
+PROJECT_DIR="/mnt/c/Users/Gamer/Documents/GitHub/Agent-Financeiro"
 APP_URL="http://127.0.0.1:8501"
 LOG_OUT="$PROJECT_DIR/streamlit_local.out.log"
 LOG_ERR="$PROJECT_DIR/streamlit_local.err.log"

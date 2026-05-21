@@ -9,17 +9,29 @@ echo ==================================================
 set "VENV_PY=%~dp0venv\Scripts\python.exe"
 if exist "%VENV_PY%" (
     set "PYTHON=%VENV_PY%"
+) else if exist "%~dp0python311\python.exe" (
+    set "PYTHON=%~dp0python311\python.exe"
+) else if exist "%~dp0python-3.11.8-embed\python.exe" (
+    set "PYTHON=%~dp0python-3.11.8-embed\python.exe"
 ) else (
     set "PYTHON=python"
 )
 
 "%PYTHON%" --version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERRO] Python nao encontrado.
-    echo Instale o Python 3.10+ ou crie o ambiente virtual com:
-    echo     python -m venv venv
-    pause
-    exit /b
+    if exist "%~dp0python311\python.exe" (
+        set "PYTHON=%~dp0python311\python.exe"
+        echo [INFO] Ignorando venv quebrado e usando python311\python.exe.
+    ) else if exist "%~dp0python-3.11.8-embed\python.exe" (
+        set "PYTHON=%~dp0python-3.11.8-embed\python.exe"
+        echo [INFO] Ignorando venv quebrado e usando python-3.11.8-embed\python.exe.
+    ) else (
+        echo [ERRO] Python nao encontrado.
+        echo Instale o Python 3.10+ ou crie o ambiente virtual com:
+        echo     python -m venv venv
+        pause
+        exit /b
+    )
 )
 
 "%PYTHON%" -m streamlit --version >nul 2>&1

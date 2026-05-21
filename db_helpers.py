@@ -1,9 +1,10 @@
 from typing import Optional, List, Dict, Any
 import os
 from datetime import date, datetime
+import calendar
 from database import get_db_connection, run_query
 
-DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
+DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
 NON_OPERATIONAL_CATEGORIES = (
     "Emprestimo Socios",
     "Empr\u00e9stimo S\u00f3cios",
@@ -217,6 +218,8 @@ def create_product(company_id: int, name: str, price: float = 0.0, sku: Optional
         conn.commit()
         cur.close()
         conn.close()
+        if sku:
+            add_product_barcode(pid, sku, label="Código principal", is_primary=True)
         return pid
     except Exception as e:
         print(f"Erro create_product: {e}")
@@ -230,6 +233,145 @@ def get_products(company_id: Optional[int] = None) -> List[Dict[str, Any]]:
     else:
         res = run_query("SELECT * FROM products ORDER BY id DESC")
     return res or []
+
+
+def normalize_barcode(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return "".join(str(value).strip().split())
+
+
+def find_product_by_barcode(barcode: Optional[str], company_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    code = normalize_barcode(barcode)
+    if not code:
+        return None
+
+
+def _add_months(base_date: date, months: int) -> date:
+    month_index = base_date.month - 1 + months
+    year = base_date.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(base_date.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+    params: tuple[Any, ...] = (code,)
+    company_filter = ""
+    if company_id:
+        company_filter = " AND p.company_id = %s"
+        params = (code, company_id)
+
+    if _table_exists("product_barcodes"):
+        rows = run_query(
+            f"""
+            SELECT p.*, b.barcode, b.label AS barcode_label, b.is_primary
+            FROM product_barcodes b
+            JOIN products p ON p.id = b.product_id
+            WHERE b.barcode = %s{company_filter}
+            LIMIT 1
+            """,
+            params
+        ) or []
+        if rows:
+            rows[0]["barcode_source"] = "product_barcodes"
+            return rows[0]
+
+    rows = run_query(
+        f"""
+        SELECT p.*, p.sku AS barcode, 'SKU' AS barcode_label, 1 AS is_primary
+        FROM products p
+        WHERE TRIM(COALESCE(p.sku, '')) = %s{company_filter}
+        LIMIT 1
+        """,
+        params
+    ) or []
+    if rows:
+        rows[0]["barcode_source"] = "products.sku"
+        return rows[0]
+    return None
+
+
+def get_product_barcodes(product_id: int) -> List[Dict[str, Any]]:
+    if not _table_exists("product_barcodes"):
+        return []
+    return run_query(
+        "SELECT * FROM product_barcodes WHERE product_id = %s ORDER BY is_primary DESC, id DESC",
+        (product_id,)
+    ) or []
+
+
+def add_product_barcode(
+    product_id: int,
+    barcode: Optional[str],
+    label: Optional[str] = None,
+    is_primary: bool = False
+) -> Optional[int]:
+    code = normalize_barcode(barcode)
+    if not code or not _table_exists("product_barcodes"):
+        return None
+
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+
+        cur.execute(f"SELECT id, product_id FROM product_barcodes WHERE barcode = {ph}", (code,))
+        existing = cur.fetchone()
+        if existing:
+            existing_id = existing[0]
+            existing_product_id = existing[1]
+            if int(existing_product_id) != int(product_id):
+                raise Exception("Código de barras já vinculado a outro produto.")
+            if is_primary:
+                cur.execute(f"UPDATE product_barcodes SET is_primary = 0 WHERE product_id = {ph}", (product_id,))
+                cur.execute(f"UPDATE product_barcodes SET is_primary = 1 WHERE id = {ph}", (existing_id,))
+                cur.execute(f"UPDATE products SET sku = {ph} WHERE id = {ph}", (code, product_id))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return int(existing_id)
+
+        if is_primary:
+            cur.execute(f"UPDATE product_barcodes SET is_primary = 0 WHERE product_id = {ph}", (product_id,))
+
+        query = (
+            f"INSERT INTO product_barcodes (product_id, barcode, label, is_primary) "
+            f"VALUES ({ph}, {ph}, {ph}, {ph})"
+        )
+        if DB_TYPE == "postgres":
+            cur.execute(query + " RETURNING id", (product_id, code, label, is_primary))
+            barcode_id = cur.fetchone()[0]
+        else:
+            cur.execute(query, (product_id, code, label, is_primary))
+            barcode_id = cur.lastrowid
+
+        if is_primary:
+            cur.execute(f"UPDATE products SET sku = {ph} WHERE id = {ph}", (code, product_id))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return barcode_id
+    except Exception as e:
+        print(f"Erro add_product_barcode: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        return None
+
+
+def delete_product_barcode(barcode_id: int) -> bool:
+    if not _table_exists("product_barcodes"):
+        return False
+    try:
+        return run_query("DELETE FROM product_barcodes WHERE id = %s", (barcode_id,)) is True
+    except Exception as e:
+        print(f"Erro delete_product_barcode: {e}")
+        return False
 
 def add_stock_movement(product_id: int, quantity: int, movement_type: str, reference: Optional[str] = None, source: str = 'próprio', is_paid: bool = False, unit_cost: float = 0.0, movement_date: Optional[str] = None, record_expense: bool = True) -> Optional[int]:
     conn = get_db_connection()
@@ -941,13 +1083,17 @@ def create_withdrawal(partner_id: int, amount: float, date: Optional[str] = None
 
 
 def create_partner_loan(
-    partner_id: int,
+    partner_id: Optional[int],
     direction: str,
     amount: float,
     loan_date: Optional[str] = None,
     due_date: Optional[str] = None,
     interest_rate: float = 0.0,
-    note: Optional[str] = None
+    note: Optional[str] = None,
+    installments: int = 1,
+    installment_amount: Optional[float] = None,
+    first_due_date: Optional[str] = None,
+    lender_name: Optional[str] = None
 ) -> Optional[int]:
     """
     Registra empréstimo entre sócio e empresa.
@@ -963,6 +1109,11 @@ def create_partner_loan(
     amount = float(amount or 0)
     if amount <= 0:
         return None
+    installments = max(int(installments or 1), 1)
+    installment_amount = float(installment_amount or 0)
+    if installments > 1 and installment_amount <= 0:
+        return None
+    total_repayable = round(installment_amount * installments, 2) if installments > 1 else amount
 
     conn = get_db_connection()
     if not conn:
@@ -975,13 +1126,13 @@ def create_partner_loan(
         due_sql = ph
 
         q = (
-            f"INSERT INTO partner_loans (partner_id, direction, principal_amount, outstanding_amount, interest_rate, loan_date, due_date, note, status) "
-            f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {dt_sql}, {due_sql}, {ph}, 'open')"
+            f"INSERT INTO partner_loans (partner_id, lender_name, direction, principal_amount, outstanding_amount, interest_rate, loan_date, due_date, note, status) "
+            f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {dt_sql}, {due_sql}, {ph}, 'open')"
         )
         params = (
-            (partner_id, direction, amount, amount, float(interest_rate or 0), loan_date, due_date, note)
+            (partner_id, lender_name, direction, amount, total_repayable, float(interest_rate or 0), loan_date, due_date, note)
             if loan_date
-            else (partner_id, direction, amount, amount, float(interest_rate or 0), due_date, note)
+            else (partner_id, lender_name, direction, amount, total_repayable, float(interest_rate or 0), due_date, note)
         )
 
         if DB_TYPE == "postgres":
@@ -991,14 +1142,27 @@ def create_partner_loan(
             cur.execute(q, params)
             loan_id = cur.lastrowid
 
+        if installments > 1 and _table_exists("partner_loan_installments"):
+            first_due = _parse_iso_date(first_due_date) or _parse_iso_date(due_date) or _parse_iso_date(loan_date) or date.today()
+            for idx in range(1, installments + 1):
+                inst_due = _add_months(first_due, idx - 1).isoformat()
+                cur.execute(
+                    f"INSERT INTO partner_loan_installments (loan_id, installment_no, total_installments, amount, due_date, note) "
+                    f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph})",
+                    (loan_id, idx, installments, installment_amount, inst_due, f"Parcela {idx}/{installments}")
+                )
+
         t_type = "Receita" if direction == "partner_to_company" else "Despesa"
         direction_label = "Sócio->Empresa" if direction == "partner_to_company" else "Empresa->Sócio"
+        lender_label = lender_name or "Credor"
+        direction_label = f"{lender_label}->Empresa" if direction == "partner_to_company" else f"Empresa->{lender_label}"
         dt_tx = dt_sql
         tx_q = (
             f"INSERT INTO transactions (type, amount, category, description, date, partner_id) "
             f"VALUES ({ph}, {ph}, 'Empréstimo Sócios', {ph}, {dt_tx}, {ph})"
         )
-        tx_desc = f"[LOAN:{loan_id}] Empréstimo {direction_label}. {note or ''}".strip()
+        parcel_note = f" Parcelado em {installments}x de R$ {installment_amount:.2f}." if installments > 1 else ""
+        tx_desc = f"[LOAN:{loan_id}] Empréstimo {direction_label}.{parcel_note} {note or ''}".strip()
         tx_params = (t_type, amount, tx_desc, loan_date, partner_id) if loan_date else (t_type, amount, tx_desc, partner_id)
         cur.execute(tx_q, tx_params)
 
@@ -1021,7 +1185,8 @@ def add_partner_loan_payment(
     loan_id: int,
     amount: float,
     payment_date: Optional[str] = None,
-    note: Optional[str] = None
+    note: Optional[str] = None,
+    installment_id: Optional[int] = None
 ) -> Optional[int]:
     if not _table_exists("partner_loans") or not _table_exists("partner_loan_payments"):
         return None
@@ -1049,6 +1214,20 @@ def add_partner_loan_payment(
         if amount > outstanding:
             return None
 
+        installment = None
+        if installment_id and _table_exists("partner_loan_installments"):
+            inst_rows = run_query(
+                "SELECT id, loan_id, installment_no, total_installments, amount, paid_amount, status FROM partner_loan_installments WHERE id = %s",
+                (installment_id,)
+            ) or []
+            if not inst_rows:
+                return None
+            installment = inst_rows[0]
+            if int(installment.get("loan_id") or 0) != int(loan_id):
+                return None
+            if installment.get("status") == "paid":
+                return None
+
         dt_val = payment_date if payment_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
         dt_sql = ph if payment_date else dt_val
 
@@ -1069,6 +1248,15 @@ def add_partner_loan_payment(
         )
 
         # Fluxo de caixa da amortização:
+        if installment:
+            inst_amount = float(installment.get("amount") or 0)
+            inst_paid = float(installment.get("paid_amount") or 0) + amount
+            inst_status = "paid" if inst_paid >= inst_amount else "partial"
+            cur.execute(
+                f"UPDATE partner_loan_installments SET paid_amount = {ph}, paid_date = {dt_sql}, status = {ph} WHERE id = {ph}",
+                (inst_paid, payment_date, inst_status, installment_id) if payment_date else (inst_paid, inst_status, installment_id)
+            )
+
         # partner_to_company -> empresa paga (Despesa)
         # company_to_partner -> empresa recebe (Receita)
         t_type = "Despesa" if loan.get("direction") == "partner_to_company" else "Receita"
@@ -1103,6 +1291,8 @@ def get_partner_loans(partner_id: Optional[int] = None, status: Optional[str] = 
         l.id,
         l.partner_id,
         p.name AS partner_name,
+        l.lender_name,
+        COALESCE(l.lender_name, p.name, 'Credor removido') AS lender_display,
         l.direction,
         l.principal_amount,
         l.outstanding_amount,
@@ -1124,6 +1314,45 @@ def get_partner_loans(partner_id: Optional[int] = None, status: Optional[str] = 
         query += " AND l.status = %s"
         params.append(status)
     query += " ORDER BY l.loan_date DESC, l.id DESC"
+    return run_query(query, tuple(params) if params else None) or []
+
+
+def get_partner_loan_installments(loan_id: Optional[int] = None, status: Optional[str] = None):
+    if not _table_exists("partner_loan_installments"):
+        return []
+    query = """
+    SELECT
+        i.id,
+        i.loan_id,
+        i.installment_no,
+        i.total_installments,
+        i.amount,
+        i.due_date,
+        i.status,
+        i.paid_amount,
+        i.paid_date,
+        i.note,
+        l.partner_id,
+        p.name AS partner_name,
+        l.lender_name,
+        COALESCE(l.lender_name, p.name, 'Credor removido') AS lender_display,
+        l.direction
+    FROM partner_loan_installments i
+    LEFT JOIN partner_loans l ON l.id = i.loan_id
+    LEFT JOIN partners p ON p.id = l.partner_id
+    WHERE 1=1
+    """
+    params = []
+    if loan_id:
+        query += " AND i.loan_id = %s"
+        params.append(loan_id)
+    if status:
+        if status == "open":
+            query += " AND i.status IN ('pending', 'partial')"
+        else:
+            query += " AND i.status = %s"
+            params.append(status)
+    query += " ORDER BY i.due_date ASC, i.loan_id ASC, i.installment_no ASC"
     return run_query(query, tuple(params) if params else None) or []
 
 

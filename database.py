@@ -9,7 +9,7 @@ dotenv_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=dotenv_path, override=True)
 
 # Configuração de Tipo de Banco (sqlite ou postgres)
-DB_TYPE = os.getenv("DB_TYPE", "postgres").lower()
+DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
 print(f"[DEBUG] database.py loaded DB_TYPE={DB_TYPE}, SQLITE_PATH={os.getenv('SQLITE_PATH', 'financeiro.db')}")
 
 # Configurações Postgres
@@ -156,6 +156,15 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS product_barcodes (
+        id {serial_type},
+        product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+        barcode VARCHAR(64) NOT NULL UNIQUE,
+        label VARCHAR(100),
+        is_primary BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS stock_movements (
         id {serial_type},
         product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
@@ -201,6 +210,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS partner_loans (
         id {serial_type},
         partner_id INTEGER REFERENCES partners(id) ON DELETE SET NULL,
+        lender_name VARCHAR(255),
         direction VARCHAR(30) NOT NULL,
         principal_amount DECIMAL(12,2) NOT NULL,
         outstanding_amount DECIMAL(12,2) NOT NULL,
@@ -217,6 +227,20 @@ def init_db():
         loan_id INTEGER REFERENCES partner_loans(id) ON DELETE CASCADE,
         amount DECIMAL(12,2) NOT NULL,
         payment_date DATE DEFAULT CURRENT_DATE,
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS partner_loan_installments (
+        id {serial_type},
+        loan_id INTEGER REFERENCES partner_loans(id) ON DELETE CASCADE,
+        installment_no INTEGER DEFAULT 1,
+        total_installments INTEGER DEFAULT 1,
+        amount DECIMAL(12,2) NOT NULL,
+        due_date DATE NOT NULL,
+        status VARCHAR(20) DEFAULT 'pending',
+        paid_amount DECIMAL(12,2) DEFAULT 0,
+        paid_date DATE,
         note TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -294,6 +318,37 @@ def init_db():
                 run_query(statement)
     else:
         run_query(create_table_query)
+
+    try:
+        if DB_TYPE == "postgres":
+            run_query("ALTER TABLE partner_loans ADD COLUMN IF NOT EXISTS lender_name VARCHAR(255)")
+        else:
+            cols = run_query("PRAGMA table_info(partner_loans)") or []
+            if not any(c.get("name") == "lender_name" for c in cols):
+                run_query("ALTER TABLE partner_loans ADD COLUMN lender_name VARCHAR(255)")
+    except Exception as e:
+        print(f"Aviso ao preparar credores de emprestimos: {e}")
+
+    try:
+        run_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_product_barcodes_barcode ON product_barcodes(barcode)")
+        run_query("CREATE INDEX IF NOT EXISTS idx_product_barcodes_product_id ON product_barcodes(product_id)")
+        if DB_TYPE == "sqlite":
+            run_query("""
+                INSERT OR IGNORE INTO product_barcodes (product_id, barcode, label, is_primary)
+                SELECT id, TRIM(sku), 'SKU legado', 1
+                FROM products
+                WHERE sku IS NOT NULL AND TRIM(sku) <> ''
+            """)
+        else:
+            run_query("""
+                INSERT INTO product_barcodes (product_id, barcode, label, is_primary)
+                SELECT id, TRIM(sku), 'SKU legado', TRUE
+                FROM products
+                WHERE sku IS NOT NULL AND TRIM(sku) <> ''
+                ON CONFLICT (barcode) DO NOTHING
+            """)
+    except Exception as e:
+        print(f"Aviso ao preparar códigos de barras: {e}")
     
     # Migrações rápidas para Postgres
     try:

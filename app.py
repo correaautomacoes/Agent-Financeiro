@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
+import calendar
 import plotly.express as px
 import io
 from dotenv import load_dotenv
@@ -20,15 +21,25 @@ from db_helpers import (
     create_sale, create_credit_sale, add_receivable_payment,
     create_contribution, create_withdrawal, create_product_cost_adjustment,
     create_partner_loan, add_partner_loan_payment, get_partner_loans, get_partner_loans_summary,
+    get_partner_loan_installments,
     get_partner_reports, get_advanced_kpis, get_upcoming_alerts,
     get_receivables_summary, receive_installment, create_fixed_expense,
     get_inventory_report, get_revenue_details, get_infra_inventory, get_accounts_receivable_summary,
     estimate_sale_cost,
     delete_history_item, get_all_transactions, get_detailed_stock_report,
-    get_categories, create_category
+    get_categories, create_category,
+    find_product_by_barcode, add_product_barcode, get_product_barcodes, delete_product_barcode,
+    normalize_barcode
 )
 from backup_utils import export_backup, import_backup
 import os
+
+def add_months(base_date: date, months: int) -> date:
+    month_index = base_date.month - 1 + months
+    year = base_date.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(base_date.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
 
 st.set_page_config(page_title="Agente Financeiro", page_icon="💰", layout="wide")
 
@@ -245,7 +256,29 @@ with tab_manual:
         else:
             prods_dict = {p['id']: p for p in prods}
             p_options = {f"{p['name']} (Padrão: R$ {float(p['price']):.2f})": p['id'] for p in prods}
-            selected_p = st.selectbox("Selecione o Produto", options=["-"] + list(p_options.keys()))
+            sale_barcode = normalize_barcode(st.text_input(
+                "Código de barras",
+                key="sale_barcode_scan",
+                placeholder="Escaneie ou digite o código e pressione Enter"
+            ))
+            sale_scan_product = find_product_by_barcode(sale_barcode) if sale_barcode else None
+            if sale_barcode and not sale_scan_product:
+                st.warning("Código não encontrado. Cadastre o produto ou associe este código em Gerenciar > Produtos e Estoque.")
+            elif sale_scan_product:
+                st.success(f"Produto localizado: {sale_scan_product['name']}")
+
+            product_labels = list(p_options.keys())
+            default_sale_label = "-"
+            if sale_scan_product:
+                default_sale_label = next(
+                    (label for label, pid in p_options.items() if int(pid) == int(sale_scan_product["id"])),
+                    "-"
+                )
+            selected_p = st.selectbox(
+                "Selecione o Produto",
+                options=["-"] + product_labels,
+                index=(["-"] + product_labels).index(default_sale_label) if default_sale_label in ["-"] + product_labels else 0
+            )
             
             if selected_p != "-":
                 p_id = p_options[selected_p]
@@ -525,17 +558,44 @@ with tab_manual:
         st.subheader("Entrada ou Saída de Peças")
         prods_e = get_products()
         p_options_e = {p['name']: p['id'] for p in prods_e}
+
+        stock_barcode = normalize_barcode(st.text_input(
+            "Código de barras",
+            key="stock_barcode_scan",
+            placeholder="Escaneie para localizar ou cadastrar produto"
+        ))
+        stock_scan_product = find_product_by_barcode(stock_barcode) if stock_barcode else None
+        if stock_scan_product:
+            st.success(f"Produto localizado: {stock_scan_product['name']}")
+        elif stock_barcode:
+            st.info("Código novo. O cadastro rápido abaixo já vai vincular este código ao produto.")
         
         # Adiciona opção de cadastrar novo
-        selected_p_e = st.selectbox("Produto", options=["-", "➕ Cadastrar Novo Produto"] + list(p_options_e.keys()), key="stock_p")
+        stock_options = ["-", "➕ Cadastrar Novo Produto"] + list(p_options_e.keys())
+        default_stock_label = "➕ Cadastrar Novo Produto" if stock_barcode and not stock_scan_product else "-"
+        if stock_scan_product:
+            default_stock_label = next(
+                (name for name, pid in p_options_e.items() if int(pid) == int(stock_scan_product["id"])),
+                "-"
+            )
+        if default_stock_label != "-":
+            st.session_state["stock_p"] = default_stock_label
+        selected_p_e = st.selectbox(
+            "Produto",
+            options=stock_options,
+            index=stock_options.index(default_stock_label) if default_stock_label in stock_options else 0,
+            key="stock_p"
+        )
         
         new_p_name = ""
         new_p_price = 0.0
+        new_p_barcode = stock_barcode
         
         if selected_p_e == "➕ Cadastrar Novo Produto":
-            col_n1, col_n2 = st.columns(2)
+            col_n1, col_n2, col_n3 = st.columns(3)
             new_p_name = col_n1.text_input("Nome do Novo Produto", placeholder="Ex: Notebook i5 Dell")
             new_p_price = col_n2.number_input("Preço de Venda Sugerido (R$)", min_value=0.0, step=0.01)
+            new_p_barcode = normalize_barcode(col_n3.text_input("Código", value=stock_barcode, placeholder="Código de barras"))
             st.divider()
 
         tipo_e = st.selectbox("Movimento", ["Entrada (Compra/Ajuste)", "Saída (Perda/Ajuste)"])
@@ -567,7 +627,7 @@ with tab_manual:
                         else:
                             c_id = comps[0]['id']
                         
-                        target_p_id = create_product(c_id, new_p_name, new_p_price)
+                        target_p_id = create_product(c_id, new_p_name, new_p_price, new_p_barcode or None)
                         if not target_p_id:
                             st.error(f"Erro ao criar o produto '{new_p_name}'. Verifique o banco de dados.")
                             st.stop()
@@ -578,6 +638,13 @@ with tab_manual:
                     target_p_id = p_options_e[selected_p_e]
 
                 if target_p_id:
+                    if stock_barcode and not stock_scan_product:
+                        add_product_barcode(
+                            product_id=target_p_id,
+                            barcode=stock_barcode,
+                            label="Leitura de estoque",
+                            is_primary=False
+                        )
                     res = add_stock_movement(
                         product_id=target_p_id,
                         quantity=qty_e,
@@ -1218,7 +1285,12 @@ with tab4:
     prod_price = st.number_input("Preço", min_value=0.0, format="%.2f", key="prod_price")
     if st.button("➕ Criar Produto"):
         if prod_comp and prod_comp != "-":
-            prid = create_product(companies_select[prod_comp], prod_name, prod_price, prod_sku)
+            normalized_sku = normalize_barcode(prod_sku)
+            existing_barcode_product = find_product_by_barcode(normalized_sku) if normalized_sku else None
+            if existing_barcode_product:
+                st.error(f"Código já vinculado ao produto: {existing_barcode_product['name']}")
+                st.stop()
+            prid = create_product(companies_select[prod_comp], prod_name, prod_price, normalized_sku or None)
             if prid:
                 st.success(f"Produto criado (id={prid})")
             else:
@@ -1237,6 +1309,60 @@ with tab4:
         if selected_pid and selected_pid != "-":
             qty = get_stock_level(int(selected_pid))
             st.info(f"Quantidade em estoque: {qty}")
+
+            st.markdown("**Códigos de barras do produto**")
+            product_codes = get_product_barcodes(int(selected_pid))
+            if product_codes:
+                st.dataframe(
+                    pd.DataFrame(product_codes)[['id', 'barcode', 'label', 'is_primary']],
+                    use_container_width=True
+                )
+            else:
+                st.caption("Nenhum código vinculado a este produto.")
+
+            bc1, bc2, bc3 = st.columns([2, 2, 1])
+            new_barcode = normalize_barcode(bc1.text_input("Novo código", key="new_product_barcode", placeholder="Escaneie ou digite"))
+            new_barcode_label = bc2.text_input("Rótulo", key="new_product_barcode_label", placeholder="Ex: EAN, fornecedor, caixa")
+            new_barcode_primary = bc3.checkbox("Principal", key="new_product_barcode_primary")
+
+            if st.button("Vincular Código", key="btn_add_product_barcode"):
+                if not new_barcode:
+                    st.warning("Informe um código para vincular.")
+                else:
+                    found = find_product_by_barcode(new_barcode)
+                    if found and int(found["id"]) != int(selected_pid):
+                        st.error(f"Código já vinculado ao produto: {found['name']}")
+                    else:
+                        barcode_id = add_product_barcode(
+                            int(selected_pid),
+                            new_barcode,
+                            label=new_barcode_label or None,
+                            is_primary=bool(new_barcode_primary)
+                        )
+                        if barcode_id:
+                            st.success("Código vinculado com sucesso.")
+                            st.rerun()
+                        else:
+                            st.error("Não foi possível vincular o código.")
+
+            if product_codes:
+                remove_options = {
+                    f"#{bc['id']} | {bc['barcode']} | {bc.get('label') or 'Sem rótulo'}": int(bc["id"])
+                    for bc in product_codes
+                }
+                remove_label = st.selectbox(
+                    "Remover código",
+                    options=["-"] + list(remove_options.keys()),
+                    key="remove_product_barcode"
+                )
+                if st.button("Remover Código", key="btn_remove_product_barcode"):
+                    if remove_label == "-":
+                        st.warning("Selecione um código para remover.")
+                    elif delete_product_barcode(remove_options[remove_label]):
+                        st.success("Código removido.")
+                        st.rerun()
+                    else:
+                        st.error("Não foi possível remover o código.")
 
         st.markdown("**Custos Adicionais por Produto (aumenta CMV futuro)**")
         cost_product_label = st.selectbox(
@@ -1289,14 +1415,27 @@ with tab4:
         st.info("Cadastre um sócio primeiro.")
 
     st.divider()
-    st.subheader("🏦 Empréstimos Sócio <> Empresa")
-    if partners:
+    st.subheader("🏦 Empréstimos / Dívidas")
+    if True:
         loan_partner_opts = {p['name']: p['id'] for p in partners}
         col_l1, col_l2, col_l3 = st.columns(3)
-        loan_partner_name = col_l1.selectbox("Sócio (Empréstimo)", options=list(loan_partner_opts.keys()), key="loan_partner")
+        creditor_sources = ["Credor externo"]
+        if loan_partner_opts:
+            creditor_sources.insert(0, "Sócio cadastrado")
+        creditor_source = col_l1.selectbox("Origem do credor", options=creditor_sources, key="loan_creditor_source")
+        if creditor_source == "Sócio cadastrado":
+            loan_partner_name = col_l1.selectbox("Sócio / credor", options=list(loan_partner_opts.keys()), key="loan_partner")
+            loan_partner_id = loan_partner_opts[loan_partner_name]
+            loan_lender_name = loan_partner_name
+            direction_options = ["Sócio -> Empresa", "Empresa -> Sócio"]
+        else:
+            loan_partner_name = None
+            loan_partner_id = None
+            loan_lender_name = col_l1.text_input("Credor", key="loan_lender_name", placeholder="Ex: Banco X, Pessoa X, agiota")
+            direction_options = ["Credor -> Empresa", "Empresa -> Credor"]
         loan_direction_label = col_l2.selectbox(
             "Direção do Empréstimo",
-            ["Sócio -> Empresa", "Empresa -> Sócio"],
+            direction_options,
             key="loan_direction"
         )
         loan_amount = col_l3.number_input("Valor do Empréstimo (R$)", min_value=0.01, step=0.01, key="loan_amount")
@@ -1310,17 +1449,88 @@ with tab4:
         loan_interest = col_li1.number_input("Juros (% ao mês, opcional)", min_value=0.0, step=0.1, key="loan_interest")
         loan_note = col_li2.text_input("Observação do Empréstimo", key="loan_note", placeholder="Ex: Capital de giro")
 
-        if st.button("Registrar Empréstimo", key="btn_create_loan"):
-            direction_map = {"Sócio -> Empresa": "partner_to_company", "Empresa -> Sócio": "company_to_partner"}
-            loan_id = create_partner_loan(
-                partner_id=loan_partner_opts[loan_partner_name],
-                direction=direction_map[loan_direction_label],
-                amount=loan_amount,
-                loan_date=str(loan_date),
-                due_date=str(due_date) if has_due else None,
-                interest_rate=loan_interest,
-                note=loan_note
+        st.markdown("**Parcelamento / juros**")
+        col_lp1, col_lp2, col_lp3 = st.columns(3)
+        is_installment_loan = col_lp1.checkbox("Pagar em parcelas", key="loan_is_installment")
+        loan_installments = col_lp2.number_input(
+            "Qtd. parcelas",
+            min_value=1,
+            max_value=60,
+            value=5 if is_installment_loan else 1,
+            step=1,
+            disabled=not is_installment_loan,
+            key="loan_installments"
+        )
+        first_installment_due = col_lp3.date_input(
+            "1º vencimento",
+            value=due_date if has_due else date.today(),
+            disabled=not is_installment_loan,
+            key="loan_first_installment_due"
+        )
+
+        calc_method = "Sem parcelas"
+        installment_amount = float(loan_amount)
+        total_repayable = float(loan_amount)
+        if is_installment_loan:
+            col_lc1, col_lc2 = st.columns([2, 1])
+            calc_method = col_lc1.selectbox(
+                "Como calcular as parcelas",
+                ["Parcela fixa com juros ao mês (PRICE)", "Total com juros simples", "Informar valor da parcela"],
+                key="loan_calc_method"
             )
+            if calc_method == "Informar valor da parcela":
+                installment_amount = float(col_lc2.number_input("Valor de cada parcela (R$)", min_value=0.01, step=0.01, key="loan_manual_installment_amount"))
+                total_repayable = round(installment_amount * int(loan_installments), 2)
+            elif calc_method == "Total com juros simples":
+                monthly_rate = float(loan_interest or 0) / 100
+                total_repayable = round(float(loan_amount) * (1 + monthly_rate * int(loan_installments)), 2)
+                installment_amount = round(total_repayable / int(loan_installments), 2)
+            else:
+                monthly_rate = float(loan_interest or 0) / 100
+                if monthly_rate > 0:
+                    installment_amount = round(float(loan_amount) * monthly_rate / (1 - (1 + monthly_rate) ** (-int(loan_installments))), 2)
+                else:
+                    installment_amount = round(float(loan_amount) / int(loan_installments), 2)
+                total_repayable = round(installment_amount * int(loan_installments), 2)
+
+            preview_rows = [
+                {
+                    "Parcela": f"{idx}/{int(loan_installments)}",
+                    "Vencimento": add_months(first_installment_due, idx - 1).isoformat(),
+                    "Valor": installment_amount,
+                }
+                for idx in range(1, int(loan_installments) + 1)
+            ]
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Principal recebido", f"R$ {float(loan_amount):,.2f}")
+            p2.metric("Total a pagar", f"R$ {total_repayable:,.2f}")
+            p3.metric("Parcela", f"R$ {installment_amount:,.2f}")
+            st.dataframe(pd.DataFrame(preview_rows).style.format({"Valor": "R$ {:.2f}"}), use_container_width=True, hide_index=True)
+
+        if st.button("Registrar Empréstimo", key="btn_create_loan"):
+            direction_map = {
+                "Sócio -> Empresa": "partner_to_company",
+                "Empresa -> Sócio": "company_to_partner",
+                "Credor -> Empresa": "partner_to_company",
+                "Empresa -> Credor": "company_to_partner",
+            }
+            if creditor_source == "Credor externo" and not str(loan_lender_name or "").strip():
+                st.error("Informe o nome do credor externo.")
+                loan_id = None
+            else:
+                loan_id = create_partner_loan(
+                    partner_id=loan_partner_id,
+                    lender_name=loan_lender_name,
+                    direction=direction_map[loan_direction_label],
+                    amount=loan_amount,
+                    loan_date=str(loan_date),
+                    due_date=str(due_date) if has_due else None,
+                    interest_rate=loan_interest,
+                    note=f"{loan_note} | {calc_method}".strip(" |"),
+                    installments=int(loan_installments) if is_installment_loan else 1,
+                    installment_amount=installment_amount if is_installment_loan else None,
+                    first_due_date=str(first_installment_due) if is_installment_loan else None
+                )
             if loan_id:
                 st.success(f"Empréstimo registrado (id={loan_id}).")
                 st.rerun()
@@ -1330,19 +1540,45 @@ with tab4:
         st.markdown("**Amortização de Empréstimos**")
         open_loans = get_partner_loans(status="open")
         if open_loans:
-            loan_items = {f"#{l['id']} | {l.get('partner_name','-')} | {'Sócio->Empresa' if l['direction']=='partner_to_company' else 'Empresa->Sócio'} | Saldo R$ {float(l['outstanding_amount']):.2f}": l for l in open_loans}
+            loan_items = {f"#{l['id']} | {l.get('lender_display') or l.get('partner_name','-')} | {'Credor->Empresa' if l['direction']=='partner_to_company' else 'Empresa->Credor'} | Saldo R$ {float(l['outstanding_amount']):.2f}": l for l in open_loans}
             selected_open_loan = st.selectbox("Selecione o empréstimo em aberto", options=list(loan_items.keys()), key="loan_payment_target")
+            selected_loan = loan_items[selected_open_loan]
+            pending_installments = get_partner_loan_installments(loan_id=int(selected_loan["id"]), status="open")
+            selected_installment = None
+            default_pay_amount = 0.01
+            default_pay_date = date.today()
+            if pending_installments:
+                installment_items = {
+                    f"Parcela {i['installment_no']}/{i['total_installments']} | Vence {i['due_date']} | Pendente R$ {float(i['amount']) - float(i.get('paid_amount') or 0):.2f}": i
+                    for i in pending_installments
+                }
+                selected_installment_label = st.selectbox("Parcela pendente", options=list(installment_items.keys()), key="loan_payment_installment")
+                selected_installment = installment_items[selected_installment_label]
+                default_pay_amount = max(float(selected_installment["amount"]) - float(selected_installment.get("paid_amount") or 0), 0.01)
+                default_pay_date = pd.to_datetime(selected_installment["due_date"]).date()
+                st.dataframe(
+                    pd.DataFrame(pending_installments)[["installment_no", "total_installments", "due_date", "amount", "paid_amount", "status"]].rename(columns={
+                        "installment_no": "Parcela",
+                        "total_installments": "Total",
+                        "due_date": "Vencimento",
+                        "amount": "Valor",
+                        "paid_amount": "Pago",
+                        "status": "Status",
+                    }).style.format({"Valor": "R$ {:.2f}", "Pago": "R$ {:.2f}"}),
+                    use_container_width=True,
+                    hide_index=True
+                )
             pl1, pl2, pl3 = st.columns(3)
-            pay_amount = pl1.number_input("Valor da Amortização (R$)", min_value=0.01, step=0.01, key="loan_payment_amount")
-            pay_date = pl2.date_input("Data da Amortização", value=date.today(), key="loan_payment_date")
+            pay_amount = pl1.number_input("Valor da Amortização (R$)", min_value=0.01, value=float(default_pay_amount), step=0.01, key="loan_payment_amount")
+            pay_date = pl2.date_input("Data da Amortização", value=default_pay_date, key="loan_payment_date")
             pay_note = pl3.text_input("Observação da Amortização", key="loan_payment_note")
             if st.button("Registrar Amortização", key="btn_add_loan_payment"):
-                selected_loan = loan_items[selected_open_loan]
                 pay_id = add_partner_loan_payment(
                     loan_id=int(selected_loan["id"]),
                     amount=pay_amount,
                     payment_date=str(pay_date),
-                    note=pay_note
+                    note=pay_note,
+                    installment_id=int(selected_installment["id"]) if selected_installment else None
                 )
                 if pay_id:
                     st.success(f"Amortização registrada (id={pay_id}).")
@@ -1434,7 +1670,7 @@ with tab4:
             if st.button("⚠️ Restaurar Backup (Sobrescrever dados)", use_container_width=True):
                 with st.spinner("Restaurando dados..."):
                     # Para SQLite usamos bytes, para Postgres usamos string
-                    if os.getenv("DB_TYPE", "postgres").lower() == "sqlite":
+                    if os.getenv("DB_TYPE", "sqlite").lower() == "sqlite":
                         content = uploaded_backup.getvalue() # Bytes
                     else:
                         content = uploaded_backup.getvalue().decode("utf-8") # String
