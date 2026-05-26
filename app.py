@@ -844,17 +844,20 @@ with tab2:
             # Formatar colunas para exibição
             display_df = pdf[[
                 'name', 'share_pct', 'share_of_profit',
-                'pending_receivable_balance', 'available_balance', 'total_withdrawn'
+                'pending_receivable_balance', 'available_balance',
+                'total_position_balance', 'total_withdrawn'
             ]].copy()
             display_df.columns = [
                 'Sócio', '% Participação', 'Lucro Gerado',
-                'Saldo Pendente a Receber', 'Saldo Disponível', 'Total Retirado'
+                'Saldo Pendente a Receber', 'Saldo de Lucro',
+                'Saldo Total com Aportes', 'Total Retirado'
             ]
             st.table(display_df.style.format({
                 '% Participação': '{:.1f}%',
                 'Lucro Gerado': 'R$ {:.2f}',
                 'Saldo Pendente a Receber': 'R$ {:.2f}',
-                'Saldo Disponível': 'R$ {:.2f}',
+                'Saldo de Lucro': 'R$ {:.2f}',
+                'Saldo Total com Aportes': 'R$ {:.2f}',
                 'Total Retirado': 'R$ {:.2f}',
             }))
         else:

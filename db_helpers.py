@@ -1425,6 +1425,8 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
         r['capital_balance'] = float(r['total_contributed']) - float(r['total_withdrawn'])
         # Saldo disponível de lucro = lucro gerado menos o que ainda está a prazo e o que já foi retirado.
         r['available_balance'] = r['share_of_profit'] - r['pending_receivable_balance'] - float(r['total_withdrawn'])
+        # Posição total do sócio na empresa, considerando também os aportes.
+        r['total_position_balance'] = float(r['total_contributed']) + r['share_of_profit'] - r['pending_receivable_balance'] - float(r['total_withdrawn'])
     return res
 
 def get_advanced_kpis(period: str = 'month'):
