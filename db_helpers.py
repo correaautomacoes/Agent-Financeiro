@@ -613,6 +613,12 @@ def create_sale(
     try:
         cur = conn.cursor()
         qty_sold = int(quantity)
+        # Debug logging: mostra parâmetros recebidos e nível de estoque atual
+        try:
+            current_avail = get_stock_level(product_id)
+        except Exception:
+            current_avail = 'err'
+        print(f"[DEBUG] create_sale called: product_id={product_id}, quantity={qty_sold}, unit_price={unit_price}, payment_mode={payment_mode}, upfront_amount={upfront_amount}, sale_date={sale_date}, avail={current_avail}")
         avail = get_stock_level(product_id)
         if avail < qty_sold:
             raise Exception(f"Estoque insuficiente ({avail})")
@@ -741,7 +747,9 @@ def create_sale(
         conn.close()
         return tx_id if tx_id else -1
     except Exception as e:
+        import traceback
         print(f"Erro create_sale: {e}")
+        traceback.print_exc()
         if conn:
             try:
                 conn.rollback()
