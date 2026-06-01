@@ -17,14 +17,16 @@ def sanitize_data(data):
         return data.isoformat()
     return data
 
-import streamlit as st
-
 load_dotenv()
 
 # Prioriza a chave vinda da interface (session_state), depois .env
 def get_api_key():
-    if "api_key" in st.session_state and st.session_state.api_key:
-        return st.session_state.api_key
+    try:
+        import streamlit as st
+        if "api_key" in st.session_state and st.session_state.api_key:
+            return st.session_state.api_key
+    except Exception:
+        pass
     return os.getenv("GEMINI_API_KEY")
 
 def set_api_key_permanent(new_key):
@@ -50,9 +52,11 @@ def set_api_key_permanent(new_key):
     
     # Atualiza o ambiente do processo atual também
     os.environ["GEMINI_API_KEY"] = new_key
-    st.session_state.api_key = new_key
-
-API_KEY = get_api_key()
+    try:
+        import streamlit as st
+        st.session_state.api_key = new_key
+    except Exception:
+        pass
 
 def configure_genai():
     key = get_api_key()
@@ -60,8 +64,6 @@ def configure_genai():
         genai.configure(api_key=key)
         return True
     return False
-
-configure_genai()
 
 # Tentando usar o modelo mais leve "latest"
 MODEL_NAME = "gemini-flash-latest"

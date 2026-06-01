@@ -255,7 +255,10 @@ with tab_manual:
             st.warning("Nenhum produto cadastrado. Vá em 'Estoque' para criar produtos.")
         else:
             prods_dict = {p['id']: p for p in prods}
-            p_options = {f"{p['name']} (Padrão: R$ {float(p['price']):.2f})": p['id'] for p in prods}
+            p_options = {
+                f"{p['name']} (ID {p['id']} - R$ {float(p['price']):.2f})": p['id']
+                for p in prods
+            }
             sale_barcode = normalize_barcode(st.text_input(
                 "Código de barras",
                 key="sale_barcode_scan",
@@ -265,7 +268,7 @@ with tab_manual:
             if sale_barcode and not sale_scan_product:
                 st.warning("Código não encontrado. Cadastre o produto ou associe este código em Gerenciar > Produtos e Estoque.")
             elif sale_scan_product:
-                st.success(f"Produto localizado: {sale_scan_product['name']}")
+                st.success(f"Produto localizado: {sale_scan_product['name']} (ID {sale_scan_product['id']})")
 
             product_labels = list(p_options.keys())
             default_sale_label = "-"
