@@ -12,6 +12,8 @@ NON_OPERATIONAL_CATEGORIES = (
     "Amortiza\u00e7\u00e3o Empr\u00e9stimo",
     "Estoque/Compra",
     "Estoque/Custo Adicional",
+    "Repasse Consignação",
+    "Comissão Vendedora",
     "Venda a Prazo",
 )
 INFRA_INVESTMENT_CATEGORIES = ("Infraestrutura", "Software/Infra")
@@ -82,6 +84,14 @@ def _get_latest_in_unit_cost(product_id: int) -> float:
     if not rows:
         return 0.0
     return float(rows[0].get("unit_cost") or 0.0)
+
+
+def _get_latest_consignment_cost(product_id: int, supplier_id: int) -> float:
+    rows = run_query(
+        "SELECT unit_cost FROM stock_movements WHERE product_id = %s AND movement_type='in' AND source='consignado' AND consignment_supplier_id = %s AND unit_cost > 0 ORDER BY id DESC LIMIT 1",
+        (product_id, supplier_id)
+    ) or []
+    return float(rows[0].get("unit_cost") or 0.0) if rows else 0.0
 
 
 def _get_pending_cost_adjustments(product_id: int):
@@ -373,7 +383,7 @@ def delete_product_barcode(barcode_id: int) -> bool:
         print(f"Erro delete_product_barcode: {e}")
         return False
 
-def add_stock_movement(product_id: int, quantity: int, movement_type: str, reference: Optional[str] = None, source: str = 'próprio', is_paid: bool = False, unit_cost: float = 0.0, movement_date: Optional[str] = None, record_expense: bool = True) -> Optional[int]:
+def add_stock_movement(product_id: int, quantity: int, movement_type: str, reference: Optional[str] = None, source: str = 'próprio', is_paid: bool = False, unit_cost: float = 0.0, movement_date: Optional[str] = None, record_expense: bool = True, consignment_supplier_id: Optional[int] = None) -> Optional[int]:
     conn = get_db_connection()
     if not conn:
         return None
@@ -392,12 +402,16 @@ def add_stock_movement(product_id: int, quantity: int, movement_type: str, refer
                 unit_cost = _get_latest_in_unit_cost(product_id)
 
         ph = "?" if DB_TYPE == "sqlite" else "%s"
-        query = f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, source, is_paid, unit_cost) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
+        if source == "consignado" and not consignment_supplier_id:
+            raise Exception("Fornecedor consignante é obrigatório.")
+
+        query = f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, source, is_paid, unit_cost, consignment_supplier_id) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
+        movement_params = (product_id, qty, movement_type, reference, source, is_paid, unit_cost, consignment_supplier_id)
         if DB_TYPE == "postgres":
-            cur.execute(query + " RETURNING id", (product_id, qty, movement_type, reference, source, is_paid, unit_cost))
+            cur.execute(query + " RETURNING id", movement_params)
             mid = cur.fetchone()[0]
         else:
-            cur.execute(query, (product_id, qty, movement_type, reference, source, is_paid, unit_cost))
+            cur.execute(query, movement_params)
             mid = cur.lastrowid
 
         if movement_type == 'in' and is_paid and unit_cost > 0 and record_expense:
@@ -442,6 +456,243 @@ def get_stock_level(product_id: int) -> int:
     return 0
 
 
+def create_consignment_supplier(company_id: int, name: str, contact: Optional[str] = None) -> Optional[int]:
+    if not str(name or "").strip() or not _table_exists("consignment_suppliers"):
+        return None
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        q = f"INSERT INTO consignment_suppliers (company_id, name, contact) VALUES ({ph}, {ph}, {ph})"
+        params = (company_id, str(name).strip(), str(contact or "").strip() or None)
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            supplier_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            supplier_id = cur.lastrowid
+        conn.commit()
+        cur.close()
+        conn.close()
+        return supplier_id
+    except Exception as e:
+        print(f"Erro create_consignment_supplier: {e}")
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return None
+
+
+def get_consignment_suppliers(company_id: Optional[int] = None):
+    if not _table_exists("consignment_suppliers"):
+        return []
+    query = "SELECT id, company_id, name, contact FROM consignment_suppliers"
+    params = []
+    if company_id:
+        query += " WHERE company_id = %s"
+        params.append(company_id)
+    query += " ORDER BY name"
+    return run_query(query, tuple(params) if params else None) or []
+
+
+def get_consignment_payables(open_only: bool = False):
+    if not _table_exists("consignment_payables"):
+        return []
+    query = """
+        SELECT cp.*, COALESCE(cs.name, 'Fornecedor removido') AS supplier_name,
+               COALESCE(p.name, 'Produto removido') AS product_name,
+               (cp.total_amount - cp.paid_amount) AS outstanding_amount
+        FROM consignment_payables cp
+        LEFT JOIN consignment_suppliers cs ON cs.id = cp.supplier_id
+        LEFT JOIN products p ON p.id = cp.product_id
+    """
+    if open_only:
+        query += " WHERE cp.status IN ('open', 'partial') AND cp.total_amount > cp.paid_amount"
+    query += " ORDER BY cp.due_date IS NULL, cp.due_date, cp.id"
+    return run_query(query) or []
+
+
+def pay_consignment_payable(payable_id: int, amount: float, payment_date: Optional[str] = None, note: Optional[str] = None) -> Optional[int]:
+    if not _table_exists("consignment_payables") or not _table_exists("consignment_payments"):
+        return None
+
+    amount = float(amount or 0)
+    if amount <= 0:
+        return None
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        rows = run_query("SELECT * FROM consignment_payables WHERE id = %s", (payable_id,)) or []
+        if not rows:
+            return None
+        payable = rows[0]
+        outstanding = float(payable.get("total_amount") or 0) - float(payable.get("paid_amount") or 0)
+        if amount > outstanding + 0.005:
+            return None
+        dt_val = payment_date if payment_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
+        dt_sql = ph if payment_date else dt_val
+        q = f"INSERT INTO consignment_payments (payable_id, amount, payment_date, note) VALUES ({ph}, {ph}, {dt_sql}, {ph})"
+        params = (payable_id, amount, payment_date, note) if payment_date else (payable_id, amount, note)
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            payment_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            payment_id = cur.lastrowid
+        new_paid = min(float(payable.get("total_amount") or 0), float(payable.get("paid_amount") or 0) + amount)
+        status = "paid" if new_paid >= float(payable.get("total_amount") or 0) else "partial"
+        cur.execute(f"UPDATE consignment_payables SET paid_amount = {ph}, status = {ph} WHERE id = {ph}", (new_paid, status, payable_id))
+        tx_q = f"INSERT INTO transactions (type, amount, category, description, date, product_id) VALUES ('Despesa', {ph}, 'Repasse Consignação', {ph}, {dt_sql}, {ph})"
+        tx_desc = f"Repasse consignado: {payable.get('supplier_name') or 'Fornecedor'} | Título #{payable_id}. {note or ''}".strip()
+        tx_params = (amount, tx_desc, payment_date, payable.get("product_id")) if payment_date else (amount, tx_desc, payable.get("product_id"))
+        cur.execute(tx_q, tx_params)
+        conn.commit()
+        cur.close()
+        conn.close()
+        return payment_id
+    except Exception as e:
+        print(f"Erro pay_consignment_payable: {e}")
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return None
+
+
+def create_salesperson(company_id: int, name: str, contact: Optional[str] = None, default_commission_pct: float = 0.0) -> Optional[int]:
+    if not str(name or "").strip() or not _table_exists("salespeople"):
+        return None
+    pct = min(max(float(default_commission_pct or 0), 0), 100)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        q = f"INSERT INTO salespeople (company_id, name, contact, default_commission_pct) VALUES ({ph}, {ph}, {ph}, {ph})"
+        params = (company_id, str(name).strip(), str(contact or "").strip() or None, pct)
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            salesperson_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            salesperson_id = cur.lastrowid
+        conn.commit()
+        cur.close()
+        conn.close()
+        return salesperson_id
+    except Exception as e:
+        print(f"Erro create_salesperson: {e}")
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return None
+
+
+def get_salespeople(company_id: Optional[int] = None, active_only: bool = True):
+    if not _table_exists("salespeople"):
+        return []
+    query = "SELECT id, company_id, name, contact, default_commission_pct, active FROM salespeople WHERE 1=1"
+    params = []
+    if company_id:
+        query += " AND company_id = %s"
+        params.append(company_id)
+    if active_only:
+        query += " AND active = " + ("TRUE" if DB_TYPE == "postgres" else "1")
+    query += " ORDER BY name"
+    return run_query(query, tuple(params) if params else None) or []
+
+
+def get_salesperson_commissions(open_only: bool = False):
+    if not _table_exists("salesperson_commissions"):
+        return []
+    query = """
+        SELECT sc.*, COALESCE(s.name, 'Vendedora removida') AS salesperson_name,
+               COALESCE(p.name, 'Produto removido') AS product_name,
+               (sc.commission_amount - sc.paid_amount) AS outstanding_amount,
+               (sc.gross_profit - sc.commission_amount) AS net_profit
+        FROM salesperson_commissions sc
+        LEFT JOIN salespeople s ON s.id = sc.salesperson_id
+        LEFT JOIN products p ON p.id = sc.product_id
+    """
+    if open_only:
+        query += " WHERE sc.status IN ('open', 'partial') AND sc.commission_amount > sc.paid_amount"
+    query += " ORDER BY sc.sale_date, sc.id"
+    return run_query(query) or []
+
+
+def add_salesperson_bonus(commission_id: int, bonus_amount: float, note: Optional[str] = None) -> bool:
+    if not _table_exists("salesperson_commissions"):
+        return False
+    bonus_amount = float(bonus_amount or 0)
+    if bonus_amount <= 0:
+        return False
+    rows = run_query("SELECT commission_amount, bonus_amount, paid_amount FROM salesperson_commissions WHERE id = %s", (commission_id,)) or []
+    if not rows:
+        return False
+    current = rows[0]
+    new_bonus = float(current.get("bonus_amount") or 0) + bonus_amount
+    new_commission = float(current.get("commission_amount") or 0) + bonus_amount
+    new_paid = float(current.get("paid_amount") or 0)
+    status = "paid" if new_paid >= new_commission else ("partial" if new_paid > 0 else "open")
+    desc = note or "Bônus extra combinado"
+    result = run_query(
+        "UPDATE salesperson_commissions SET bonus_amount = %s, commission_amount = %s, status = %s, note = %s WHERE id = %s",
+        (new_bonus, new_commission, status, desc, commission_id)
+    )
+    return result is True
+
+
+def pay_salesperson_commission(commission_id: int, amount: float, payment_date: Optional[str] = None, note: Optional[str] = None) -> Optional[int]:
+    if not _table_exists("salesperson_commissions") or not _table_exists("salesperson_commission_payments"):
+        return None
+    amount = float(amount or 0)
+    if amount <= 0:
+        return None
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        rows = run_query("SELECT * FROM salesperson_commissions WHERE id = %s", (commission_id,)) or []
+        if not rows:
+            return None
+        commission = rows[0]
+        outstanding = float(commission.get("commission_amount") or 0) - float(commission.get("paid_amount") or 0)
+        if amount > outstanding + 0.005:
+            return None
+        dt_val = payment_date if payment_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
+        dt_sql = ph if payment_date else dt_val
+        q = f"INSERT INTO salesperson_commission_payments (commission_id, amount, payment_date, note) VALUES ({ph}, {ph}, {dt_sql}, {ph})"
+        params = (commission_id, amount, payment_date, note) if payment_date else (commission_id, amount, note)
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            payment_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            payment_id = cur.lastrowid
+        new_paid = min(float(commission.get("commission_amount") or 0), float(commission.get("paid_amount") or 0) + amount)
+        status = "paid" if new_paid >= float(commission.get("commission_amount") or 0) else "partial"
+        cur.execute(f"UPDATE salesperson_commissions SET paid_amount = {ph}, status = {ph} WHERE id = {ph}", (new_paid, status, commission_id))
+        tx_q = f"INSERT INTO transactions (type, amount, category, description, date, product_id) VALUES ('Despesa', {ph}, 'Comissão Vendedora', {ph}, {dt_sql}, {ph})"
+        tx_desc = f"Comissão para {commission.get('salesperson_name') or 'Vendedora'} | Venda #{commission.get('sale_transaction_id') or '-'} | Comissão #{commission_id}. {note or ''}".strip()
+        tx_params = (amount, tx_desc, payment_date, commission.get("product_id")) if payment_date else (amount, tx_desc, commission.get("product_id"))
+        cur.execute(tx_q, tx_params)
+        conn.commit()
+        cur.close()
+        conn.close()
+        return payment_id
+    except Exception as e:
+        print(f"Erro pay_salesperson_commission: {e}")
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return None
 def create_product_cost_adjustment(
     product_id: int,
     amount: float,
@@ -605,7 +856,15 @@ def create_sale(
     payment_mode: str = "avista",
     installments: int = 1,
     upfront_amount: float = 0.0,
-    first_due_date: Optional[str] = None
+    first_due_date: Optional[str] = None,
+    inventory_source: str = "próprio",
+    consignment_supplier_id: Optional[int] = None,
+    consignment_unit_amount: float = 0.0,
+    salesperson_id: Optional[int] = None,
+    commission_pct: Optional[float] = None,
+    delivery_cost: float = 0.0,
+    agreed_commission_amount: float = 0.0,
+    bonus_amount: float = 0.0
 ) -> Optional[int]:
     conn = get_db_connection()
     if not conn:
@@ -626,6 +885,7 @@ def create_sale(
         total = float(unit_price) * qty_sold
         if total <= 0:
             raise Exception("Valor total da venda inválido")
+        delivery_cost = max(float(delivery_cost or 0), 0.0)
 
         payment_mode = (payment_mode or "avista").lower()
         if payment_mode not in ("avista", "parcelado", "aprazo"):
@@ -642,8 +902,18 @@ def create_sale(
         else:
             installments = max(int(installments or 1), 1)
 
-        estimate = estimate_sale_cost(product_id, qty_sold)
-        blended_unit_cost = float(estimate["estimated_unit_cost"])
+        inventory_source = "consignado" if str(inventory_source or "").lower() == "consignado" else "próprio"
+        if inventory_source == "consignado":
+            if not consignment_supplier_id:
+                raise Exception("Fornecedor consignante é obrigatório para esta venda.")
+            blended_unit_cost = float(consignment_unit_amount or 0)
+            if blended_unit_cost <= 0:
+                blended_unit_cost = _get_latest_consignment_cost(product_id, int(consignment_supplier_id))
+            if blended_unit_cost <= 0:
+                raise Exception("Informe o valor unitário devido ao consignante.")
+        else:
+            estimate = estimate_sale_cost(product_id, qty_sold)
+            blended_unit_cost = float(estimate["estimated_unit_cost"])
 
         if _table_exists("product_cost_adjustments"):
             ph = "?" if DB_TYPE == "sqlite" else "%s"
@@ -663,8 +933,8 @@ def create_sale(
 
         ph = "?" if DB_TYPE == "sqlite" else "%s"
         cur.execute(
-            f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, unit_cost) VALUES ({ph}, {ph}, 'out', {ph}, {ph})",
-            (product_id, qty_sold, description, blended_unit_cost)
+            f"INSERT INTO stock_movements (product_id, quantity, movement_type, reference, source, unit_cost, consignment_supplier_id) VALUES ({ph}, {ph}, 'out', {ph}, {ph}, {ph}, {ph})",
+            (product_id, qty_sold, description, inventory_source, blended_unit_cost, consignment_supplier_id)
         )
 
         dt_val = sale_date if sale_date else ("date('now')" if DB_TYPE == "sqlite" else "CURRENT_DATE")
@@ -683,6 +953,16 @@ def create_sale(
             else:
                 cur.execute(q, params)
                 tx_id = cur.lastrowid
+
+        if delivery_cost > 0:
+            delivery_desc = f"Entrega da venda: {description or 'Venda'}"
+            delivery_q = f"INSERT INTO transactions (type, amount, category, description, date, product_id, partner_id, company_id) VALUES ('Despesa', {ph}, 'Entrega Venda', {ph}, {dt_sql}, {ph}, {ph}, {ph})"
+            delivery_params = (
+                (delivery_cost, delivery_desc, sale_date, product_id, partner_id, company_id)
+                if sale_date else
+                (delivery_cost, delivery_desc, product_id, partner_id, company_id)
+            )
+            cur.execute(delivery_q, delivery_params)
 
         pending_amount = max(total - upfront_amount, 0)
         if pending_amount > 0:
@@ -741,6 +1021,47 @@ def create_sale(
                     )
                     r_note = f"Venda a receber - parcela {idx}/{inst_count}. {description or ''}".strip()
                     cur.execute(r_q, (product_id, tx_id, idx, inst_count, value, str(due), r_note))
+
+        if inventory_source == "consignado":
+            payable_total = round(blended_unit_cost * qty_sold, 2)
+            payable_q = (
+                f"INSERT INTO consignment_payables "
+                f"(supplier_id, product_id, sale_transaction_id, quantity, unit_amount, total_amount, paid_amount, sale_date, due_date, status, note) "
+                f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 0, {dt_sql}, {ph}, 'open', {ph})"
+            )
+            payable_params = (
+                (consignment_supplier_id, product_id, tx_id, qty_sold, blended_unit_cost, payable_total, sale_date, first_due_date or sale_date, description)
+                if sale_date else
+                (consignment_supplier_id, product_id, tx_id, qty_sold, blended_unit_cost, payable_total, first_due_date, description)
+            )
+            cur.execute(payable_q, payable_params)
+
+        if salesperson_id and _table_exists("salesperson_commissions"):
+            seller_rows = run_query(
+                "SELECT default_commission_pct FROM salespeople WHERE id = %s AND active = " + ("TRUE" if DB_TYPE == "postgres" else "1"),
+                (salesperson_id,)
+            ) or []
+            if not seller_rows:
+                raise Exception("Vendedora não encontrada ou inativa.")
+            seller_pct = float(commission_pct if commission_pct is not None else seller_rows[0].get("default_commission_pct") or 0)
+            seller_pct = min(max(seller_pct, 0), 100)
+            cost_total = round(blended_unit_cost * qty_sold, 2)
+            gross_profit = max(round(total - cost_total - delivery_cost, 2), 0.0)
+            bonus_amount = max(float(bonus_amount or 0), 0.0)
+            agreed_commission_amount = max(float(agreed_commission_amount or 0), 0.0)
+            base_commission = agreed_commission_amount if agreed_commission_amount > 0 else round(gross_profit * seller_pct / 100, 2)
+            commission_amount = round(base_commission + bonus_amount, 2)
+            commission_q = (
+                f"INSERT INTO salesperson_commissions "
+                f"(salesperson_id, sale_transaction_id, product_id, sale_date, sale_amount, cost_amount, gross_profit, commission_pct, commission_amount, bonus_amount, paid_amount, status, note) "
+                f"VALUES ({ph}, {ph}, {ph}, {dt_sql}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, 0, 'open', {ph})"
+            )
+            commission_params = (
+                (salesperson_id, tx_id, product_id, sale_date, total, cost_total, gross_profit, seller_pct, commission_amount, bonus_amount, description)
+                if sale_date else
+                (salesperson_id, tx_id, product_id, total, cost_total, gross_profit, seller_pct, commission_amount, bonus_amount, description)
+            )
+            cur.execute(commission_q, commission_params)
 
         conn.commit()
         cur.close()
@@ -1384,6 +1705,166 @@ def create_fixed_expense(company_id: int, name: str, amount: float, due_day: int
     ph = "?" if DB_TYPE == "sqlite" else "%s"
     return run_query(f"INSERT INTO fixed_expenses (company_id, name, amount, due_day) VALUES ({ph}, {ph}, {ph}, {ph})", (company_id, name, amount, due_day))
 
+
+def create_company_asset(
+    company_id: int,
+    name: str,
+    category: str,
+    quantity: int,
+    unit_value: float,
+    acquisition_date: Optional[str] = None,
+    location: Optional[str] = None,
+    condition: str = "Bom",
+    asset_code: Optional[str] = None,
+    note: Optional[str] = None
+) -> Optional[int]:
+    if not _table_exists("company_assets") or not str(name or "").strip():
+        return None
+    quantity = int(quantity or 0)
+    unit_value = float(unit_value or 0)
+    if quantity <= 0 or unit_value < 0:
+        return None
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        q = (
+            f"INSERT INTO company_assets "
+            f"(company_id, name, category, quantity, unit_value, acquisition_date, location, condition, asset_code, note) "
+            f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
+        )
+        params = (company_id, str(name).strip(), category or "Outros", quantity, unit_value, acquisition_date, location, condition or "Bom", asset_code, note)
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            asset_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            asset_id = cur.lastrowid
+        conn.commit()
+        cur.close()
+        conn.close()
+        return asset_id
+    except Exception as e:
+        print(f"Erro create_company_asset: {e}")
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return None
+
+
+def get_company_assets(company_id: Optional[int] = None, active_only: bool = False):
+    if not _table_exists("company_assets"):
+        return []
+    query = """
+        SELECT a.*, (a.quantity * a.unit_value) AS total_value,
+               c.name AS company_name
+        FROM company_assets a
+        LEFT JOIN companies c ON c.id = a.company_id
+        WHERE 1=1
+    """
+    params = []
+    if company_id:
+        query += " AND a.company_id = %s"
+        params.append(company_id)
+    if active_only:
+        query += " AND a.status = 'Ativo'"
+    query += " ORDER BY a.category, a.name"
+    return run_query(query, tuple(params) if params else None) or []
+
+
+def get_company_assets_summary(company_id: Optional[int] = None):
+    assets = get_company_assets(company_id=company_id, active_only=True)
+    total_value = sum(float(asset.get("total_value") or 0) for asset in assets)
+    total_quantity = sum(int(asset.get("quantity") or 0) for asset in assets)
+    by_category = {}
+    for asset in assets:
+        category = asset.get("category") or "Outros"
+        by_category[category] = by_category.get(category, 0.0) + float(asset.get("total_value") or 0)
+    return {"total_value": total_value, "total_quantity": total_quantity, "by_category": by_category}
+
+
+def get_monthly_payables(year: int, month: int):
+    if not _table_exists("fixed_expenses"):
+        return []
+    query = """
+        SELECT fe.id, fe.company_id, fe.name, fe.amount, fe.due_day,
+               fe.start_date, fe.end_date,
+               fp.id AS payment_id, fp.amount AS paid_amount, fp.paid_date,
+               fp.note AS payment_note,
+               CASE WHEN fp.id IS NULL THEN 'Pendente' ELSE 'Pago' END AS payment_status
+        FROM fixed_expenses fe
+        LEFT JOIN fixed_expense_payments fp
+          ON fp.fixed_expense_id = fe.id
+         AND fp.competence_year = %s
+         AND fp.competence_month = %s
+        WHERE (fe.start_date IS NULL OR fe.start_date <= %s)
+          AND (fe.end_date IS NULL OR fe.end_date >= %s)
+        ORDER BY fe.due_day, fe.name
+    """
+    competence = f"{int(year):04d}-{int(month):02d}-01"
+    return run_query(query, (year, month, competence, competence)) or []
+
+
+def pay_monthly_payable(fixed_expense_id: int, year: int, month: int, amount: float, paid_date: Optional[str] = None, note: Optional[str] = None) -> Optional[int]:
+    if not _table_exists("fixed_expense_payments"):
+        return None
+    amount = float(amount or 0)
+    if amount <= 0:
+        return None
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        expense_rows = run_query("SELECT id, name, amount, company_id FROM fixed_expenses WHERE id = %s", (fixed_expense_id,)) or []
+        if not expense_rows:
+            return None
+        expense = expense_rows[0]
+        existing = run_query(
+            "SELECT id FROM fixed_expense_payments WHERE fixed_expense_id = %s AND competence_year = %s AND competence_month = %s",
+            (fixed_expense_id, year, month)
+        ) or []
+        if existing:
+            return None
+        payment_date_value = paid_date or date.today().isoformat()
+        q = (
+            f"INSERT INTO fixed_expense_payments "
+            f"(fixed_expense_id, competence_year, competence_month, amount, paid_date, note) "
+            f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
+        )
+        params = (fixed_expense_id, year, month, amount, payment_date_value, note)
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            payment_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            payment_id = cur.lastrowid
+        tx_q = (
+            f"INSERT INTO transactions (type, amount, category, description, date, company_id) "
+            f"VALUES ('Despesa', {ph}, 'Contas Fixas', {ph}, {ph}, {ph})"
+        )
+        tx_desc = f"{expense['name']} - competência {int(month):02d}/{int(year)}. {note or ''}".strip()
+        if DB_TYPE == "postgres":
+            cur.execute(tx_q + " RETURNING id", (amount, tx_desc, payment_date_value, expense.get("company_id")))
+            transaction_id = cur.fetchone()[0]
+        else:
+            cur.execute(tx_q, (amount, tx_desc, payment_date_value, expense.get("company_id")))
+            transaction_id = cur.lastrowid
+        cur.execute(f"UPDATE fixed_expense_payments SET transaction_id = {ph} WHERE id = {ph}", (transaction_id, payment_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return payment_id
+    except Exception as e:
+        print(f"Erro pay_monthly_payable: {e}")
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return None
+
 def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]]:
     query = """
     SELECT 
@@ -1500,11 +1981,44 @@ def get_advanced_kpis(period: str = 'month'):
         r['total_cash'] = res_cash[0]['total_cash'] if res_cash else 0
         cmv = float(res_cmv[0]['cmv']) if res_cmv else 0
         # Lucro operacional exclui investimentos em infraestrutura.
-        r['net_profit'] = float(r['revenue']) - float(r['expenses']) - cmv
+        commission_filter_sql = filter_sql.replace("date", "sale_date")
+        commission_rows = run_query(
+            f"SELECT COALESCE(SUM(commission_amount), 0) AS total FROM salesperson_commissions WHERE {commission_filter_sql}"
+        ) if _table_exists("salesperson_commissions") else []
+        commission_expenses = float(commission_rows[0].get('total', 0) or 0) if commission_rows else 0.0
+        r['commission_expenses'] = commission_expenses
+        r['gross_profit'] = float(r['revenue']) - cmv
+        r['net_profit'] = float(r['revenue']) - float(r['expenses']) - cmv - commission_expenses
         r['accounting_profit'] = r['net_profit'] - float(r.get('infra_investment') or 0)
         r['cmv'] = cmv
         return [r]
     return None
+
+
+def get_chat_insight_context():
+    """Monta um retrato somente leitura para perguntas analíticas do chat."""
+    context = {
+        "kpis_mes": get_advanced_kpis("month") or [],
+        "kpis_ano": get_advanced_kpis("year") or [],
+        "despesas_por_categoria_mes": run_query(
+            "SELECT COALESCE(category, 'Sem categoria') AS category, SUM(amount) AS total "
+            "FROM transactions WHERE type='Despesa' AND strftime('%Y-%m', date)=strftime('%Y-%m', 'now') "
+            "GROUP BY category ORDER BY total DESC"
+        ) or [],
+        "receitas_por_categoria_mes": run_query(
+            "SELECT COALESCE(category, 'Sem categoria') AS category, SUM(amount) AS total "
+            "FROM transactions WHERE type='Receita' AND strftime('%Y-%m', date)=strftime('%Y-%m', 'now') "
+            "GROUP BY category ORDER BY total DESC"
+        ) or [],
+        "contas_fixas_mes": get_monthly_payables(date.today().year, date.today().month),
+        "repasses_consignacao_abertos": get_consignment_payables(open_only=True),
+        "comissoes_vendedoras_abertas": get_salesperson_commissions(open_only=True),
+        "patrimonio": get_company_assets_summary(),
+        "ultimas_transacoes": run_query(
+            "SELECT date, type, amount, category, description FROM transactions ORDER BY date DESC, id DESC LIMIT 100"
+        ) or [],
+    }
+    return context
 
 def get_upcoming_alerts():
     day_fn = "EXTRACT(DAY FROM CURRENT_DATE)" if DB_TYPE == "postgres" else "strftime('%d', 'now')"

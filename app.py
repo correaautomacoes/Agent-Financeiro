@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import date
 import calendar
 import plotly.express as px
+import plotly.graph_objects as go
 import io
 from dotenv import load_dotenv
 from pathlib import Path
@@ -29,7 +30,12 @@ from db_helpers import (
     delete_history_item, get_all_transactions, get_detailed_stock_report,
     get_categories, create_category,
     find_product_by_barcode, add_product_barcode, get_product_barcodes, delete_product_barcode,
-    normalize_barcode
+    normalize_barcode, create_consignment_supplier, get_consignment_suppliers,
+    get_consignment_payables, pay_consignment_payable, create_salesperson,
+    get_salespeople, get_salesperson_commissions, pay_salesperson_commission,
+    add_salesperson_bonus, get_monthly_payables, pay_monthly_payable,
+    create_company_asset, get_company_assets, get_company_assets_summary,
+    get_chat_insight_context
 )
 from backup_utils import export_backup, import_backup
 import os
@@ -60,30 +66,16 @@ with tab1:
     col_chat, col_info = st.columns([2, 1])
     
     with col_info:
-        st.subheader("🛠️ O que deseja fazer?")
-        intent_option = st.radio("Escolha uma ação para guiar a IA:", 
-                                ["Lançar Receita/Despesa", "Registrar Venda", "Entrada/Saída de Estoque", "Lançamento de Sócio", "Retirada de Sócio", "Criar Produto"])
+        st.subheader("🔎 Insights financeiros")
+        st.info("Este chat é somente leitura. Pergunte sobre gastos, receitas, lucro, juros, combustível, contas a pagar, consignados ou comissões.")
+        intent_option = "Consultar dados"
         
-        intent_map = {
-            "Lançar Receita/Despesa": "SAVE_TRANSACTION",
-            "Registrar Venda": "REGISTER_SALE",
-            "Entrada/Saída de Estoque": "STOCK_MOVEMENT",
-            "Lançamento de Sócio": "PARTNER_CONTRIBUTION",
-            "Retirada de Sócio": "PARTNER_WITHDRAWAL",
-            "Criar Produto": "CREATE_PRODUCT"
-        }
+        intent_map = {"Consultar dados": "FINANCIAL_INSIGHT"}
         selected_label = intent_option
         selected_intent = intent_map[selected_label]
         
         # Dicas dinâmicas
-        hints = {
-            "SAVE_TRANSACTION": "Ex: 'Paguei 50 reais de energia' ou 'Recebi 100 de um frete'",
-            "REGISTER_SALE": "Ex: 'Vendi 2 unidades do Produto X'",
-            "STOCK_MOVEMENT": "Ex: 'Chegaram 10 unidades do Produto Y no estoque'",
-            "PARTNER_CONTRIBUTION": "Ex: 'Sócio João fez um aporte de 1000 reais'",
-            "PARTNER_WITHDRAWAL": "Ex: 'Sócio Maria retirou 500 reais de lucro'",
-            "CREATE_PRODUCT": "Ex: 'Criar produto Pizza de Calabresa por 45 reais'"
-        }
+        hints = {"FINANCIAL_INSIGHT": "Ex: 'Quanto gastei com juros este mês?' ou 'Quanto paguei de combustível?'"}
         st.info("💡 " + hints[selected_intent])
 
     with col_chat:
@@ -111,25 +103,19 @@ with tab1:
 
             with st.chat_message("assistant"):
                 with st.spinner("Pensando..."):
-                    # Coletar entidades para a IA mapear IDs
-                    entities = {
-                        "produtos": get_products(),
-                        "socios": get_partners()
-                    }
-                    
-                    # Envia o prompt atual + dados que já temos (contexto) + intenção sugerida
-                    context = st.session_state.current_action.get("data") if st.session_state.current_action else None
-                    ai_res = process_chat_command(prompt, context, selected_intent, entities)
-                    
+                    insight_context = get_chat_insight_context()
+                    ai_res = process_chat_command(prompt, context_data=insight_context)
+                    st.session_state.current_action = ai_res
+                    reply = generate_ai_reply(ai_res)
+                    st.session_state.messages.append({"role": "assistant", "content": reply})
                     if "error" in ai_res:
-                        st.error(ai_res["error"])
-                        st.session_state.current_action = ai_res
-                        reply = generate_ai_reply(ai_res)
-                        st.session_state.messages.append({"role": "assistant", "content": reply})
+                        st.error(reply)
+                    else:
                         st.markdown(reply)
 
     # Área de confirmação (só aparece quando a IA diz que está COMPLETE)
-    if st.session_state.current_action and st.session_state.current_action.get("status") == "COMPLETE":
+    # O chat é somente leitura; lançamentos devem ser feitos nas telas operacionais.
+    if False and st.session_state.current_action and st.session_state.current_action.get("status") == "COMPLETE":
         action = st.session_state.current_action
         intent = action["intent"]
         data = action["data"]
@@ -167,11 +153,34 @@ with tab1:
                                 description=data.get("description"),
                                 sale_date=data.get("date")
                             )
+                            if data.get("source") == "consignado":
+                                sale_kwargs.update(
+                                    inventory_source="consignado",
+                                    consignment_supplier_id=data.get("consignment_supplier_id"),
+                                    consignment_unit_amount=float(data.get("consignment_unit_amount") or 0),
+                                    salesperson_id=data.get("salesperson_id"),
+                                    commission_pct=float(data.get("commission_pct") or 0),
+                                    delivery_cost=float(data.get("delivery_cost") or 0),
+                                    agreed_commission_amount=float(data.get("agreed_commission_amount") or 0),
+                                    bonus_amount=float(data.get("bonus_amount") or 0)
+                                )
+                            elif data.get("salesperson_id"):
+                                sale_kwargs.update(
+                                    salesperson_id=data.get("salesperson_id"),
+                                    commission_pct=float(data.get("commission_pct") or 0),
+                                    delivery_cost=float(data.get("delivery_cost") or 0),
+                                    agreed_commission_amount=float(data.get("agreed_commission_amount") or 0),
+                                    bonus_amount=float(data.get("bonus_amount") or 0)
+                                )
                             if data.get("payment_mode") == "credit":
-                                res = create_credit_sale(
+                                sale_kwargs["description"] = (
+                                    f"{sale_kwargs.get('description') or 'Venda'} | Cliente: {data.get('customer_name') or 'Não informado'}"
+                                )
+                                res = create_sale(
                                     **sale_kwargs,
-                                    due_date=data.get("due_date") or data.get("date"),
-                                    customer_name=data.get("customer_name")
+                                    payment_mode="aprazo",
+                                    upfront_amount=0,
+                                    first_due_date=data.get("due_date") or data.get("date")
                                 )
                             else:
                                 res = create_sale(**sale_kwargs)
@@ -206,7 +215,8 @@ with tab1:
                                 reference="Saldo inicial",
                                 source=data.get("source", "próprio"),
                                 is_paid=data.get("is_paid", False),
-                                unit_cost=data.get("amount", 0)
+                                unit_cost=data.get("amount", 0),
+                                consignment_supplier_id=data.get("consignment_supplier_id")
                             )
                         success = p_id is not None
 
@@ -223,7 +233,8 @@ with tab1:
                                 reference=data.get("description"),
                                 source=data.get("source", "próprio"),
                                 is_paid=data.get("is_paid", False),
-                                unit_cost=float(data.get("amount", 0)) / qty if qty > 0 else 0
+                                unit_cost=float(data.get("amount", 0)) / qty if qty > 0 else 0,
+                                consignment_supplier_id=data.get("consignment_supplier_id")
                             )
                             success = res is not None
                         else:
@@ -286,6 +297,74 @@ with tab_manual:
             if selected_p != "-":
                 p_id = p_options[selected_p]
                 p_obj = prods_dict[p_id]
+
+                sale_origin = st.radio(
+                    "Origem do estoque",
+                    ["Próprio", "Consignado"],
+                    horizontal=True,
+                    key="sale_origin"
+                )
+                consignment_supplier_id = None
+                consignment_unit_amount = 0.0
+                if sale_origin == "Consignado":
+                    suppliers = get_consignment_suppliers()
+                    supplier_options = {"-": None}
+                    supplier_options.update({f"{s['name']} (ID {s['id']})": int(s['id']) for s in suppliers})
+                    selected_supplier = st.selectbox("Fornecedor consignante", options=list(supplier_options.keys()), key="sale_supplier")
+                    consignment_supplier_id = supplier_options[selected_supplier]
+                    consignment_unit_amount = st.number_input(
+                        "Valor unitário a repassar ao consignante (R$)",
+                        min_value=0.01,
+                        step=0.01,
+                        value=0.01,
+                        key="sale_consignment_amount",
+                        help="Este valor vira uma conta a pagar quando a venda for registrada."
+                    )
+
+                salespeople_sale = get_salespeople()
+                salesperson_options = {"-": None}
+                salesperson_options.update({f"{s['name']} (ID {s['id']})": int(s['id']) for s in salespeople_sale})
+                selected_salesperson = st.selectbox("Vendedora", options=list(salesperson_options.keys()), key="sale_salesperson")
+                salesperson_id = salesperson_options[selected_salesperson]
+                salesperson_obj = next((s for s in salespeople_sale if int(s['id']) == int(salesperson_id)), None) if salesperson_id else None
+                commission_pct = st.number_input(
+                    "Comissão sobre o lucro bruto (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(salesperson_obj.get('default_commission_pct', 0)) if salesperson_obj else 0.0,
+                    step=0.1,
+                    key="sale_commission_pct",
+                    disabled=not bool(salesperson_id)
+                )
+                agreed_commission_amount = st.number_input(
+                    "Valor combinado da comissão (R$) - opcional",
+                    min_value=0.0,
+                    step=0.01,
+                    value=0.0,
+                    key="sale_agreed_commission",
+                    disabled=not bool(salesperson_id),
+                    help="Se informado, substitui o cálculo percentual sobre o lucro bruto."
+                )
+                sale_bonus_amount = st.number_input(
+                    "Bônus extra da venda (R$)",
+                    min_value=0.0,
+                    step=0.01,
+                    value=0.0,
+                    key="sale_bonus_amount",
+                    disabled=not bool(salesperson_id),
+                    help="O bônus aumenta a comissão e reduz o lucro líquido desta operação."
+                )
+                has_delivery_cost = st.checkbox("Esta venda tem custo de entrega?", key="sale_has_delivery")
+                delivery_cost = 0.0
+                if has_delivery_cost:
+                    delivery_cost = st.number_input(
+                        "Valor da entrega (R$)",
+                        min_value=0.01,
+                        step=0.01,
+                        value=0.01,
+                        key="sale_delivery_cost",
+                        help="Será lançado como despesa da venda e reduzirá o lucro bruto."
+                    )
                 
                 col_v1, col_v2 = st.columns(2)
                 qty_venda = col_v1.number_input("Quantidade", min_value=1, value=1, key="v_qty")
@@ -299,8 +378,15 @@ with tab_manual:
                 # Preview do lucro já considerando custos adicionais vinculados ao produto.
                 custo_estimado = estimate_sale_cost(p_id, qty_venda)
                 ultimo_custo = float(custo_estimado.get('estimated_unit_cost') or 0.0)
+                if sale_origin == "Consignado":
+                    ultimo_custo = float(consignment_unit_amount or 0.0)
                 total_venda = preco_venda * qty_venda
-                lucro_bruto = total_venda - float(custo_estimado.get('estimated_total_cost') or 0.0)
+                custo_produto_venda = ultimo_custo * qty_venda
+                custo_total_venda = custo_produto_venda + float(delivery_cost or 0)
+                lucro_bruto = total_venda - custo_total_venda
+                comissao_base = float(agreed_commission_amount or 0) if float(agreed_commission_amount or 0) > 0 else max(lucro_bruto, 0) * float(commission_pct or 0) / 100
+                comissao_prevista = comissao_base + float(sale_bonus_amount or 0)
+                lucro_liquido = lucro_bruto - comissao_prevista
                 
                 col_i1, col_i2 = st.columns(2)
                 col_i1.info(f"💰 **Total da Venda:** R$ {total_venda:.2f}")
@@ -308,9 +394,11 @@ with tab_manual:
                     col_i2.success(f"📈 **Lucro desta venda:** R$ {lucro_bruto:.2f}")
                     if float(custo_estimado.get('extra_cost_total') or 0.0) > 0:
                         st.caption(
-                            f"Custo estimado desta venda: R$ {float(custo_estimado.get('estimated_total_cost') or 0.0):.2f} "
+                            f"Custo total desta venda: R$ {custo_total_venda:.2f} "
                             f"(inclui R$ {float(custo_estimado.get('extra_cost_total') or 0.0):.2f} de despesas vinculadas)."
                         )
+                if salesperson_id:
+                    st.caption(f"Comissão prevista para {salesperson_obj['name']}: R$ {comissao_prevista:.2f} | Lucro líquido: R$ {lucro_liquido:.2f}")
                 
                 col_d1, col_d2 = st.columns(2)
                 data_venda = col_d1.date_input("Data da Venda", value=date.today(), key="v_data")
@@ -386,7 +474,15 @@ with tab_manual:
                         payment_mode=modo,
                         installments=int(parcelas),
                         upfront_amount=float(entrada),
-                        first_due_date=str(primeira_parcela)
+                        first_due_date=str(primeira_parcela),
+                        inventory_source="consignado" if sale_origin == "Consignado" else "próprio",
+                        consignment_supplier_id=consignment_supplier_id,
+                        consignment_unit_amount=float(consignment_unit_amount),
+                        salesperson_id=salesperson_id,
+                        commission_pct=float(commission_pct),
+                        delivery_cost=float(delivery_cost),
+                        agreed_commission_amount=float(agreed_commission_amount),
+                        bonus_amount=float(sale_bonus_amount)
                     )
                     if res is not None:
                         pendente = max(float(total_venda) - float(entrada), 0)
@@ -611,6 +707,14 @@ with tab_manual:
             pago = st.checkbox("Já foi pago?")
         with col_st2:
             custo_uni = st.number_input("Custo Unitário / Valor de Acerto (R$)", min_value=0.0, step=0.01, help="Mesmo se for consignado, coloque o valor que você deve pagar ao fornecedor.")
+
+        consignment_supplier_id = None
+        if consignado:
+            suppliers_stock = get_consignment_suppliers()
+            supplier_stock_options = {"-": None}
+            supplier_stock_options.update({f"{s['name']} (ID {s['id']})": int(s['id']) for s in suppliers_stock})
+            selected_stock_supplier = st.selectbox("Fornecedor consignante", options=list(supplier_stock_options.keys()), key="stock_supplier")
+            consignment_supplier_id = supplier_stock_options[selected_stock_supplier]
             
         ref_e = st.text_input("Referência/Motivo", placeholder="Ex: Compra fornecedor X")
 
@@ -655,7 +759,8 @@ with tab_manual:
                         reference=ref_e,
                         source="consignado" if consignado else "próprio",
                         is_paid=pago,
-                        unit_cost=custo_uni
+                        unit_cost=custo_uni,
+                        consignment_supplier_id=consignment_supplier_id
                     )
                     if res:
                         st.success(f"✅ Estoque {'cadastrado e ' if selected_p_e == '➕ Cadastrar Novo Produto' else ''}atualizado!")
@@ -710,22 +815,35 @@ with tab2:
     infra_inventory = get_infra_inventory()
     receivable_summary = get_accounts_receivable_summary()
     receivables = get_receivables_summary()
+    salesperson_commissions_open = get_salesperson_commissions(open_only=True)
+    salesperson_commission_balance = sum(float(item.get('outstanding_amount') or 0) for item in salesperson_commissions_open)
+    consignment_payables_open = get_consignment_payables(open_only=True)
+    consignment_payable_balance = sum(float(item.get('outstanding_amount') or 0) for item in consignment_payables_open)
+    monthly_payables = get_monthly_payables(date.today().year, date.today().month)
+    monthly_payables_pending = sum(
+        float(item.get('amount') or 0)
+        for item in monthly_payables
+        if item.get('payment_status') == 'Pendente'
+    )
     partner_capital_row = run_query("SELECT COALESCE(SUM(amount), 0) AS total FROM contributions")
     # Mostramos o valor de VENDA total no dashboard (é o potencial de receita parada)
     total_inv_sale = sum([item.get('total_sale_value', 0) for item in inv_data]) if inv_data else 0
     total_inv_cost = sum([item.get('total_cost_value', 0) for item in inv_data]) if inv_data else 0
     total_infra_assets = sum([item.get('total_invested', 0) for item in infra_inventory]) if infra_inventory else 0
+    asset_summary = get_company_assets_summary()
+    company_assets = get_company_assets(active_only=True)
     total_partner_capital = float(partner_capital_row[0].get('total', 0)) if partner_capital_row else 0
     total_invested_capital = total_inv_cost + total_infra_assets
 
     # KPIs Principais
     if kpi_data:
         k = kpi_data[0]
-        top_1, top_2, top_3, top_4 = st.columns(4)
+        top_1, top_2, top_3, top_4, top_5 = st.columns(5)
         top_1.metric("📈 Faturamento", f"R$ {float(k.get('revenue', 0)):.2f}")
         top_2.metric("📉 Desp. Operacionais", f"R$ {float(k.get('expenses', 0)):.2f}", delta_color="inverse")
         top_3.metric("🏷️ CMV", f"R$ {float(k.get('cmv', 0)):.2f}", delta_color="inverse")
-        top_4.metric("💡 Lucro Operacional", f"R$ {float(k.get('net_profit', 0)):.2f}")
+        top_4.metric("📊 Lucro Bruto", f"R$ {float(k.get('gross_profit', 0)):.2f}")
+        top_5.metric("💡 Lucro Líquido", f"R$ {float(k.get('net_profit', 0)):.2f}")
 
         bottom_1, bottom_2, bottom_3, bottom_4 = st.columns(4)
         bottom_1.metric("🏗️ Invest. em Infra", f"R$ {float(k.get('infra_investment', 0)):.2f}", delta_color="inverse")
@@ -734,11 +852,12 @@ with tab2:
         bottom_3.metric("💰 Saldo em Caixa", f"R$ {float(k.get('total_cash', 0)):.2f}")
         bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
     else:
-        top_1, top_2, top_3, top_4 = st.columns(4)
+        top_1, top_2, top_3, top_4, top_5 = st.columns(5)
         top_1.metric("📈 Faturamento", "R$ 0.00")
         top_2.metric("📉 Desp. Operacionais", "R$ 0.00")
         top_3.metric("🏷️ CMV", "R$ 0.00")
-        top_4.metric("💡 Lucro Operacional", "R$ 0.00")
+        top_4.metric("📊 Lucro Bruto", "R$ 0.00")
+        top_5.metric("💡 Lucro Líquido", "R$ 0.00")
 
         bottom_1, bottom_2, bottom_3, bottom_4 = st.columns(4)
         bottom_1.metric("🏗️ Invest. em Infra", "R$ 0.00")
@@ -747,13 +866,189 @@ with tab2:
         bottom_3.metric("💰 Saldo em Caixa", "R$ 0.00")
         bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
 
-    extra_1, extra_2, extra_3 = st.columns(3)
+    extra_1, extra_2, extra_3, extra_4, extra_5 = st.columns(5)
     extra_1.metric("🤝 Aportes dos Sócios", f"R$ {total_partner_capital:.2f}")
     extra_2.metric("🏛️ Capital Investido", f"R$ {total_invested_capital:.2f}")
     extra_3.metric("🧱 Patrimônio Operacional", f"R$ {total_invested_capital + float(kpi_data[0].get('total_cash', 0)) + float(receivable_summary.get('open_amount', 0)):.2f}" if kpi_data else f"R$ {total_invested_capital + float(receivable_summary.get('open_amount', 0)):.2f}")
+    extra_4.metric("👩‍💼 A repassar às vendedoras", f"R$ {salesperson_commission_balance:.2f}")
+    extra_5.metric("📦 A repassar aos consignantes", f"R$ {consignment_payable_balance:.2f}")
+
+    asset_col1, asset_col2 = st.columns(2)
+    asset_col1.metric("🏢 Patrimônio cadastrado", f"R$ {float(asset_summary['total_value']):.2f}")
+    asset_col2.metric("🧰 Itens patrimoniais", int(asset_summary['total_quantity']))
+    with st.expander("🏢 Inventário de móveis e estrutura", expanded=False):
+        if company_assets:
+            asset_df = pd.DataFrame(company_assets)[[
+                'name', 'category', 'quantity', 'unit_value', 'total_value',
+                'location', 'condition', 'asset_code', 'note'
+            ]].rename(columns={
+                'name': 'Item', 'category': 'Categoria', 'quantity': 'Qtd.',
+                'unit_value': 'Valor unitário', 'total_value': 'Valor total',
+                'location': 'Local', 'condition': 'Estado',
+                'asset_code': 'Patrimônio', 'note': 'Observação'
+            })
+            st.dataframe(
+                asset_df.style.format({'Valor unitário': 'R$ {:.2f}', 'Valor total': 'R$ {:.2f}'}),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("Nenhum item patrimonial cadastrado.")
 
     st.caption("Capital Investido = infraestrutura acumulada + estoque atual a custo. Aportes dos Sócios ficam separados porque são a origem do capital, não a aplicação dele.")
     st.caption("Saldo em Caixa não inclui vendas a prazo ainda não recebidas. O card 'A Prazo a Receber' mostra exatamente o que ainda falta entrar.")
+
+    with st.expander(f"🗓️ Contas a pagar em {date.today().strftime('%m/%Y')} | Pendente: R$ {monthly_payables_pending:.2f}", expanded=True):
+        if monthly_payables:
+            payable_month_options = {
+                f"Dia {int(item.get('due_day') or 0):02d} | {item['name']} | R$ {float(item['amount'] or 0):.2f} | {item['payment_status']}": item
+                for item in monthly_payables
+            }
+            selected_month_payable_label = st.selectbox(
+                "Compromisso da empresa",
+                options=list(payable_month_options.keys()),
+                key="monthly_payable_select"
+            )
+            selected_month_payable = payable_month_options[selected_month_payable_label]
+            if selected_month_payable.get('payment_status') == 'Pendente':
+                monthly_pay_col1, monthly_pay_col2 = st.columns(2)
+                monthly_payment_amount = monthly_pay_col1.number_input(
+                    "Valor pago (R$)",
+                    min_value=0.01,
+                    value=float(selected_month_payable['amount']),
+                    step=0.01,
+                    key="monthly_payment_amount"
+                )
+                monthly_payment_note = monthly_pay_col2.text_input("Observação", key="monthly_payment_note")
+                if st.button("✅ Marcar como pago", key="mark_monthly_payable_paid"):
+                    payment_id = pay_monthly_payable(
+                        int(selected_month_payable['id']),
+                        date.today().year,
+                        date.today().month,
+                        float(monthly_payment_amount),
+                        date.today().isoformat(),
+                        monthly_payment_note
+                    )
+                    if payment_id:
+                        st.success("Conta marcada como paga e lançada no financeiro.")
+                        st.rerun()
+                    else:
+                        st.error("Não foi possível marcar esta conta como paga.")
+            else:
+                st.success(f"Pago em {selected_month_payable.get('paid_date') or 'data não informada'}.")
+            monthly_payables_df = pd.DataFrame(monthly_payables)[[
+                'name', 'due_day', 'amount', 'payment_status', 'paid_amount', 'paid_date'
+            ]].rename(columns={
+                'name': 'Compromisso', 'due_day': 'Vencimento', 'amount': 'Valor',
+                'payment_status': 'Status', 'paid_amount': 'Pago', 'paid_date': 'Data do pagamento'
+            })
+            st.dataframe(monthly_payables_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhuma conta fixa ou compromisso cadastrado para este mês.")
+
+    with st.expander("📦 Repasses de consignação pendentes", expanded=False):
+        if consignment_payables_open:
+            payable_options_dashboard = {
+                f"#{item['id']} | {item['supplier_name']} | {item['product_name']} | Saldo R$ {float(item['outstanding_amount']):.2f}": item
+                for item in consignment_payables_open
+            }
+            selected_payable_label_dashboard = st.selectbox(
+                "Repasse a pagar",
+                options=list(payable_options_dashboard.keys()),
+                key="dashboard_consignment_payable_select"
+            )
+            selected_payable_dashboard = payable_options_dashboard[selected_payable_label_dashboard]
+            payable_outstanding_dashboard = float(selected_payable_dashboard['outstanding_amount'])
+            pay_payable_col1, pay_payable_col2 = st.columns(2)
+            payable_payment_amount = pay_payable_col1.number_input(
+                "Valor do repasse (R$)",
+                min_value=0.01,
+                max_value=payable_outstanding_dashboard,
+                value=payable_outstanding_dashboard,
+                step=0.01,
+                key="dashboard_consignment_payment_amount"
+            )
+            payable_payment_note = pay_payable_col2.text_input(
+                "Observação do repasse",
+                key="dashboard_consignment_payment_note"
+            )
+            if st.button("💸 Pagar repasse consignado", key="dashboard_pay_consignment"):
+                payment_id = pay_consignment_payable(
+                    int(selected_payable_dashboard['id']),
+                    float(payable_payment_amount),
+                    date.today().isoformat(),
+                    payable_payment_note
+                )
+                if payment_id:
+                    st.success("Repasse consignado pago e saldo atualizado.")
+                    st.rerun()
+                else:
+                    st.error("Não foi possível registrar o repasse. Confira o valor informado.")
+            st.dataframe(
+                pd.DataFrame(consignment_payables_open)[[
+                    'id', 'supplier_name', 'product_name', 'quantity', 'total_amount',
+                    'paid_amount', 'outstanding_amount', 'status'
+                ]],
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("Não há valores pendentes para repassar aos consignantes.")
+
+    with st.expander("👩‍💼 Comissões de vendedoras", expanded=False):
+        if salesperson_commissions_open:
+            commission_options = {
+                f"#{item['id']} | {item['salesperson_name']} | {item['product_name']} | Saldo R$ {float(item['outstanding_amount']):.2f}": item
+                for item in salesperson_commissions_open
+            }
+            selected_commission_label = st.selectbox("Comissão a pagar", options=list(commission_options.keys()), key="dashboard_commission_select")
+            selected_commission = commission_options[selected_commission_label]
+            commission_outstanding = float(selected_commission['outstanding_amount'])
+            bonus_col1, bonus_col2 = st.columns(2)
+            extra_bonus = bonus_col1.number_input(
+                "Bônus extra combinado (R$)", min_value=0.0, step=0.01, value=0.0,
+                key="dashboard_extra_bonus"
+            )
+            extra_bonus_note = bonus_col2.text_input("Motivo do bônus", key="dashboard_extra_bonus_note")
+            if st.button("➕ Adicionar bônus à comissão", key="dashboard_add_bonus"):
+                if extra_bonus <= 0:
+                    st.warning("Informe um bônus maior que zero.")
+                elif add_salesperson_bonus(int(selected_commission['id']), float(extra_bonus), extra_bonus_note):
+                    st.success("Bônus adicionado. O lucro líquido e o saldo a pagar foram atualizados.")
+                    st.rerun()
+                else:
+                    st.error("Não foi possível adicionar o bônus.")
+            commission_outstanding = float(selected_commission['outstanding_amount'])
+            pay_commission_col1, pay_commission_col2 = st.columns(2)
+            commission_payment_amount = pay_commission_col1.number_input(
+                "Valor do pagamento (R$)", min_value=0.01, max_value=commission_outstanding,
+                value=commission_outstanding, step=0.01, key="dashboard_commission_amount"
+            )
+            commission_payment_note = pay_commission_col2.text_input("Observação", key="dashboard_commission_note")
+            if st.button("💸 Pagar comissão", key="dashboard_pay_commission"):
+                payment_id = pay_salesperson_commission(
+                    int(selected_commission['id']),
+                    float(commission_payment_amount),
+                    date.today().isoformat(),
+                    commission_payment_note
+                )
+                if payment_id:
+                    st.success("Comissão paga e saldo atualizado.")
+                    st.rerun()
+                else:
+                    st.error("Não foi possível registrar o pagamento da comissão.")
+            st.dataframe(
+                pd.DataFrame(salesperson_commissions_open)[[
+                    'id', 'salesperson_name', 'product_name', 'sale_amount', 'cost_amount',
+                    'gross_profit', 'commission_pct', 'commission_amount', 'paid_amount',
+                    'net_profit',
+                    'bonus_amount', 'outstanding_amount', 'status'
+                ]],
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("Não há comissões de vendedoras pendentes.")
     # Alertas
     alerts = get_upcoming_alerts()
     if alerts:
@@ -908,10 +1203,28 @@ with tab2:
             st.subheader("Despesas por Categoria")
             despesas = df[df['type'] == 'Despesa']
             if not despesas.empty:
-                st.plotly_chart(px.pie(despesas, names='category', values='amount', hole=0.4), use_container_width=True)
+                despesas_agrupadas = despesas.groupby('category', dropna=False, as_index=False)['amount'].sum()
+                st.plotly_chart(
+                    go.Figure(data=[go.Pie(
+                        labels=despesas_agrupadas['category'].fillna('Sem categoria'),
+                        values=despesas_agrupadas['amount'],
+                        hole=0.4
+                    )]),
+                    use_container_width=True
+                )
         with g2:
             st.subheader("Faturamento Mensal")
-            st.plotly_chart(px.bar(df, x='date', y='amount', color='type', barmode='group'), use_container_width=True)
+            faturamento_agrupado = df.groupby(['date', 'type'], dropna=False, as_index=False)['amount'].sum()
+            figura_faturamento = go.Figure()
+            for tipo in faturamento_agrupado['type'].dropna().unique():
+                serie = faturamento_agrupado[faturamento_agrupado['type'] == tipo]
+                figura_faturamento.add_trace(go.Bar(
+                    x=serie['date'],
+                    y=serie['amount'],
+                    name=str(tipo)
+                ))
+            figura_faturamento.update_layout(barmode='group')
+            st.plotly_chart(figura_faturamento, use_container_width=True)
 
 # --- TAB: ESTOQUE ---
 with tab_stock:
@@ -1209,6 +1522,91 @@ with tab4:
     if companies:
         st.write("Empresas cadastradas:")
         st.dataframe(pd.DataFrame(companies), use_container_width=True)
+
+    st.divider()
+    st.subheader("Fornecedores consignantes")
+    supplier_company_options = {c['name']: c['id'] for c in companies} if companies else {}
+    supplier_company = st.selectbox("Empresa do consignante", options=["-"] + list(supplier_company_options.keys()), key="supplier_company")
+    supplier_name = st.text_input("Nome do fornecedor consignante", key="supplier_name")
+    supplier_contact = st.text_input("Contato (opcional)", key="supplier_contact")
+    if st.button("➕ Adicionar consignante"):
+        if supplier_company == "-" or not supplier_name.strip():
+            st.warning("Selecione a empresa e informe o nome do consignante.")
+        else:
+            supplier_id = create_consignment_supplier(supplier_company_options[supplier_company], supplier_name, supplier_contact)
+            if supplier_id:
+                st.success(f"Consignante criado (id={supplier_id}).")
+                st.rerun()
+            else:
+                st.error("Não foi possível cadastrar o consignante.")
+
+    suppliers_manage = get_consignment_suppliers()
+    if suppliers_manage:
+        st.dataframe(pd.DataFrame(suppliers_manage), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("💸 Repasses de consignação")
+    open_consignment_payables = get_consignment_payables(open_only=True)
+    if open_consignment_payables:
+        payable_options = {
+            f"#{item['id']} | {item['supplier_name']} | {item['product_name']} | Saldo R$ {float(item['outstanding_amount']):.2f}": item
+            for item in open_consignment_payables
+        }
+        selected_payable_label = st.selectbox("Título a pagar", options=list(payable_options.keys()), key="consignment_payable")
+        selected_payable = payable_options[selected_payable_label]
+        payable_outstanding = float(selected_payable['outstanding_amount'])
+        pay_col1, pay_col2 = st.columns(2)
+        consignment_payment_amount = pay_col1.number_input(
+            "Valor do repasse (R$)", min_value=0.01, max_value=payable_outstanding,
+            value=payable_outstanding, step=0.01, key="consignment_payment_amount"
+        )
+        consignment_payment_note = pay_col2.text_input("Observação do repasse", key="consignment_payment_note")
+        if st.button("💸 Registrar repasse", use_container_width=True):
+            payment_id = pay_consignment_payable(
+                int(selected_payable['id']),
+                float(consignment_payment_amount),
+                date.today().isoformat(),
+                consignment_payment_note
+            )
+            if payment_id:
+                st.success("Repasse registrado e conta a pagar atualizada.")
+                st.rerun()
+            else:
+                st.error("Não foi possível registrar o repasse.")
+        st.dataframe(
+            pd.DataFrame(open_consignment_payables)[['id', 'supplier_name', 'product_name', 'quantity', 'total_amount', 'paid_amount', 'outstanding_amount', 'status']],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Não há repasses de consignação em aberto.")
+
+    st.divider()
+    st.subheader("Vendedoras e comissões")
+    salesperson_company_options = {c['name']: c['id'] for c in companies} if companies else {}
+    salesperson_company = st.selectbox("Empresa da vendedora", options=["-"] + list(salesperson_company_options.keys()), key="salesperson_company")
+    salesperson_name = st.text_input("Nome da vendedora", key="salesperson_name")
+    salesperson_contact = st.text_input("Contato da vendedora (opcional)", key="salesperson_contact")
+    salesperson_default_pct = st.number_input("Percentual padrão sobre o lucro bruto (%)", min_value=0.0, max_value=100.0, step=0.1, key="salesperson_default_pct")
+    if st.button("➕ Adicionar vendedora"):
+        if salesperson_company == "-" or not salesperson_name.strip():
+            st.warning("Selecione a empresa e informe o nome da vendedora.")
+        else:
+            salesperson_id_created = create_salesperson(
+                salesperson_company_options[salesperson_company],
+                salesperson_name,
+                salesperson_contact,
+                salesperson_default_pct
+            )
+            if salesperson_id_created:
+                st.success(f"Vendedora criada (id={salesperson_id_created}).")
+                st.rerun()
+            else:
+                st.error("Não foi possível cadastrar a vendedora.")
+
+    salespeople_manage = get_salespeople(active_only=False)
+    if salespeople_manage:
+        st.dataframe(pd.DataFrame(salespeople_manage), use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("Sócios / Parceiros")
@@ -1632,18 +2030,61 @@ with tab4:
 
     st.divider()
     st.subheader("📅 Despesas Fixas / Programadas")
+    fixed_company_options = {c['name']: c['id'] for c in companies} if companies else {}
+    fixed_company = st.selectbox(
+        "Empresa responsável pelo compromisso",
+        options=["-"] + list(fixed_company_options.keys()),
+        key="fixed_expense_company"
+    )
     f_name = st.text_input("Nome da Despesa (ex: Aluguel)", key="fixed_name")
     col_f1, col_f2 = st.columns(2)
     f_amount = col_f1.number_input("Valor Mensal", min_value=0.0, key="fixed_amount")
     f_day = col_f2.number_input("Dia do Vencimento", min_value=1, max_value=31, value=10, key="fixed_day")
     
     if st.button("➕ Agendar Despesa Fixa"):
-        if f_name and comp_option != "-":
-            res = create_fixed_expense(companies_select[comp_option], f_name, f_amount, f_day)
+        if not companies:
+            st.warning("Cadastre uma empresa primeiro na seção 'Empresas'.")
+        elif not f_name.strip():
+            st.warning("Informe o nome da conta, por exemplo: Aluguel, Internet ou Salários.")
+        elif fixed_company == "-":
+            st.warning("Selecione a empresa responsável pelo compromisso.")
+        else:
+            res = create_fixed_expense(fixed_company_options[fixed_company], f_name.strip(), f_amount, f_day)
             if res: st.success("Despesa fixa agendada!")
             else: st.error("Erro ao agendar.")
+
+    st.divider()
+    st.subheader("🏢 Inventário Patrimonial")
+    st.caption("Cadastro de móveis, equipamentos e estrutura sem lançar receita, despesa ou alterar o caixa.")
+    asset_company_options = {c['name']: c['id'] for c in companies} if companies else {}
+    asset_company = st.selectbox("Empresa do patrimônio", options=["-"] + list(asset_company_options.keys()), key="asset_company")
+    asset_name = st.text_input("Nome do item", placeholder="Ex: Balcão, notebook, prateleira", key="asset_name")
+    asset_category = st.selectbox("Categoria", ["Móveis", "Equipamentos", "Estrutura", "Informática", "Veículos", "Outros"], key="asset_category")
+    asset_col1, asset_col2, asset_col3 = st.columns(3)
+    asset_quantity = asset_col1.number_input("Quantidade", min_value=1, value=1, step=1, key="asset_quantity")
+    asset_unit_value = asset_col2.number_input("Valor unitário (R$)", min_value=0.0, step=0.01, key="asset_unit_value")
+    asset_acquisition_date = asset_col3.date_input("Data de aquisição", value=date.today(), key="asset_acquisition_date")
+    asset_col4, asset_col5, asset_col6 = st.columns(3)
+    asset_location = asset_col4.text_input("Localização", placeholder="Ex: Loja, estoque, escritório", key="asset_location")
+    asset_condition = asset_col5.selectbox("Estado", ["Novo", "Bom", "Usado", "Manutenção"], key="asset_condition")
+    asset_code = asset_col6.text_input("Código patrimonial (opcional)", key="asset_code")
+    asset_note = st.text_input("Observação", key="asset_note")
+    if st.button("➕ Cadastrar item no inventário", key="create_asset"):
+        if asset_company == "-":
+            st.warning("Selecione a empresa do patrimônio.")
+        elif not asset_name.strip():
+            st.warning("Informe o nome do item.")
         else:
-            st.warning("Preencha o nome e selecione a empresa.")
+            asset_id = create_company_asset(
+                asset_company_options[asset_company], asset_name, asset_category,
+                int(asset_quantity), float(asset_unit_value), str(asset_acquisition_date),
+                asset_location, asset_condition, asset_code, asset_note
+            )
+            if asset_id:
+                st.success("Item cadastrado no inventário sem impacto no financeiro.")
+                st.rerun()
+            else:
+                st.error("Não foi possível cadastrar o item patrimonial.")
 
     st.divider()
     st.subheader("💾 Backup e Restauração de Dados")

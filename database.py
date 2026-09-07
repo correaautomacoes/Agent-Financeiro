@@ -165,6 +165,14 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS consignment_suppliers (
+        id {serial_type},
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        contact VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS stock_movements (
         id {serial_type},
         product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
@@ -174,6 +182,69 @@ def init_db():
         source VARCHAR(50) DEFAULT 'próprio',
         is_paid BOOLEAN DEFAULT FALSE,
         unit_cost DECIMAL(12,2) DEFAULT 0,
+        consignment_supplier_id INTEGER REFERENCES consignment_suppliers(id) ON DELETE SET NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS consignment_payables (
+        id {serial_type},
+        supplier_id INTEGER REFERENCES consignment_suppliers(id) ON DELETE SET NULL,
+        product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+        sale_transaction_id INTEGER,
+        quantity INTEGER NOT NULL DEFAULT 1,
+        unit_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+        total_amount DECIMAL(12,2) NOT NULL,
+        paid_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+        sale_date DATE DEFAULT CURRENT_DATE,
+        due_date DATE,
+        status VARCHAR(20) DEFAULT 'open',
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS consignment_payments (
+        id {serial_type},
+        payable_id INTEGER REFERENCES consignment_payables(id) ON DELETE CASCADE,
+        amount DECIMAL(12,2) NOT NULL,
+        payment_date DATE DEFAULT CURRENT_DATE,
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS salespeople (
+        id {serial_type},
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        contact VARCHAR(255),
+        default_commission_pct DECIMAL(5,2) DEFAULT 0,
+        active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS salesperson_commissions (
+        id {serial_type},
+        salesperson_id INTEGER REFERENCES salespeople(id) ON DELETE SET NULL,
+        sale_transaction_id INTEGER,
+        product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+        sale_date DATE DEFAULT CURRENT_DATE,
+        sale_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+        cost_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+        gross_profit DECIMAL(12,2) NOT NULL DEFAULT 0,
+        commission_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
+        commission_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+        bonus_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+        paid_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+        status VARCHAR(20) DEFAULT 'open',
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS salesperson_commission_payments (
+        id {serial_type},
+        commission_id INTEGER REFERENCES salesperson_commissions(id) ON DELETE CASCADE,
+        amount DECIMAL(12,2) NOT NULL,
+        payment_date DATE DEFAULT CURRENT_DATE,
+        note TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -256,6 +327,35 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS fixed_expense_payments (
+        id {serial_type},
+        fixed_expense_id INTEGER REFERENCES fixed_expenses(id) ON DELETE CASCADE,
+        competence_year INTEGER NOT NULL,
+        competence_month INTEGER NOT NULL,
+        amount DECIMAL(12,2) NOT NULL,
+        paid_date DATE DEFAULT CURRENT_DATE,
+        transaction_id INTEGER,
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(fixed_expense_id, competence_year, competence_month)
+    );
+
+    CREATE TABLE IF NOT EXISTS company_assets (
+        id {serial_type},
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        category VARCHAR(100) NOT NULL DEFAULT 'Outros',
+        quantity INTEGER NOT NULL DEFAULT 1,
+        unit_value DECIMAL(12,2) NOT NULL DEFAULT 0,
+        acquisition_date DATE,
+        location VARCHAR(255),
+        condition VARCHAR(50) NOT NULL DEFAULT 'Bom',
+        status VARCHAR(50) NOT NULL DEFAULT 'Ativo',
+        asset_code VARCHAR(100),
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS transactions (
         id {serial_type},
         type VARCHAR(20) NOT NULL,
@@ -328,6 +428,26 @@ def init_db():
                 run_query("ALTER TABLE partner_loans ADD COLUMN lender_name VARCHAR(255)")
     except Exception as e:
         print(f"Aviso ao preparar credores de emprestimos: {e}")
+
+    try:
+        if DB_TYPE == "postgres":
+            run_query("ALTER TABLE salesperson_commissions ADD COLUMN IF NOT EXISTS bonus_amount DECIMAL(12,2) NOT NULL DEFAULT 0")
+        else:
+            cols = run_query("PRAGMA table_info(salesperson_commissions)") or []
+            if not any(c.get("name") == "bonus_amount" for c in cols):
+                run_query("ALTER TABLE salesperson_commissions ADD COLUMN bonus_amount DECIMAL(12,2) NOT NULL DEFAULT 0")
+    except Exception as e:
+        print(f"Aviso ao preparar bônus de vendedora: {e}")
+
+    try:
+        if DB_TYPE == "postgres":
+            run_query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS consignment_supplier_id INTEGER REFERENCES consignment_suppliers(id) ON DELETE SET NULL")
+        else:
+            cols = run_query("PRAGMA table_info(stock_movements)") or []
+            if not any(c.get("name") == "consignment_supplier_id" for c in cols):
+                run_query("ALTER TABLE stock_movements ADD COLUMN consignment_supplier_id INTEGER")
+    except Exception as e:
+        print(f"Aviso ao preparar vínculo de consignação: {e}")
 
     try:
         run_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_product_barcodes_barcode ON product_barcodes(barcode)")
