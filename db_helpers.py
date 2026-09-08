@@ -14,6 +14,7 @@ NON_OPERATIONAL_CATEGORIES = (
     "Estoque/Custo Adicional",
     "Repasse Consignação",
     "Comissão Vendedora",
+    "Pagamento de Obrigação",
     "Venda a Prazo",
 )
 INFRA_INVESTMENT_CATEGORIES = ("Infraestrutura", "Software/Infra")
@@ -1790,7 +1791,7 @@ def get_monthly_payables(year: int, month: int):
         return []
     query = """
         SELECT fe.id, fe.company_id, fe.name, fe.amount, fe.due_day,
-               fe.start_date, fe.end_date,
+               fe.start_date, fe.end_date, fe.affects_profit,
                fp.id AS payment_id, fp.amount AS paid_amount, fp.paid_date,
                fp.note AS payment_note,
                CASE WHEN fp.id IS NULL THEN 'Pendente' ELSE 'Pago' END AS payment_status
@@ -1817,7 +1818,7 @@ def pay_monthly_payable(fixed_expense_id: int, year: int, month: int, amount: fl
     try:
         cur = conn.cursor()
         ph = "?" if DB_TYPE == "sqlite" else "%s"
-        expense_rows = run_query("SELECT id, name, amount, company_id FROM fixed_expenses WHERE id = %s", (fixed_expense_id,)) or []
+        expense_rows = run_query("SELECT id, name, amount, company_id, affects_profit FROM fixed_expenses WHERE id = %s", (fixed_expense_id,)) or []
         if not expense_rows:
             return None
         expense = expense_rows[0]
@@ -1840,16 +1841,17 @@ def pay_monthly_payable(fixed_expense_id: int, year: int, month: int, amount: fl
         else:
             cur.execute(q, params)
             payment_id = cur.lastrowid
+        expense_category = "Contas Fixas" if expense.get("affects_profit", 1) else "Pagamento de Obrigação"
         tx_q = (
             f"INSERT INTO transactions (type, amount, category, description, date, company_id) "
-            f"VALUES ('Despesa', {ph}, 'Contas Fixas', {ph}, {ph}, {ph})"
+            f"VALUES ('Despesa', {ph}, {ph}, {ph}, {ph}, {ph})"
         )
         tx_desc = f"{expense['name']} - competência {int(month):02d}/{int(year)}. {note or ''}".strip()
         if DB_TYPE == "postgres":
             cur.execute(tx_q + " RETURNING id", (amount, tx_desc, payment_date_value, expense.get("company_id")))
             transaction_id = cur.fetchone()[0]
         else:
-            cur.execute(tx_q, (amount, tx_desc, payment_date_value, expense.get("company_id")))
+            cur.execute(tx_q, (amount, expense_category, tx_desc, payment_date_value, expense.get("company_id")))
             transaction_id = cur.lastrowid
         cur.execute(f"UPDATE fixed_expense_payments SET transaction_id = {ph} WHERE id = {ph}", (transaction_id, payment_id))
         conn.commit()
@@ -2014,16 +2016,85 @@ def get_chat_insight_context():
         "repasses_consignacao_abertos": get_consignment_payables(open_only=True),
         "comissoes_vendedoras_abertas": get_salesperson_commissions(open_only=True),
         "patrimonio": get_company_assets_summary(),
+        "saldos_bancarios": run_query(
+            "SELECT name, credit_limit, current_balance, updated_at FROM bank_accounts ORDER BY name"
+        ) if _table_exists("bank_accounts") else [],
         "ultimas_transacoes": run_query(
             "SELECT date, type, amount, category, description FROM transactions ORDER BY date DESC, id DESC LIMIT 100"
         ) or [],
     }
     return context
 
+
+def get_bank_account(name: str):
+    if not _table_exists("bank_accounts"):
+        return None
+    rows = run_query("SELECT * FROM bank_accounts WHERE lower(name) = lower(%s) ORDER BY id DESC LIMIT 1", (name,)) or []
+    return rows[0] if rows else None
+
+
+def upsert_bank_account(company_id: int, name: str, credit_limit: float, current_balance: float) -> Optional[int]:
+    if not _table_exists("bank_accounts"):
+        return None
+    existing = get_bank_account(name)
+    if existing:
+        run_query(
+            "UPDATE bank_accounts SET credit_limit = %s, current_balance = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+            (float(credit_limit or 0), float(current_balance or 0), existing["id"]),
+        )
+        return existing["id"]
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        ph = "?" if DB_TYPE == "sqlite" else "%s"
+        q = f"INSERT INTO bank_accounts (company_id, name, credit_limit, current_balance) VALUES ({ph}, {ph}, {ph}, {ph})"
+        params = (company_id, name, float(credit_limit or 0), float(current_balance or 0))
+        if DB_TYPE == "postgres":
+            cur.execute(q + " RETURNING id", params)
+            account_id = cur.fetchone()[0]
+        else:
+            cur.execute(q, params)
+            account_id = cur.lastrowid
+        conn.commit()
+        cur.close()
+        conn.close()
+        return account_id
+    except Exception as e:
+        print(f"Erro upsert_bank_account: {e}")
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        return None
+
 def get_upcoming_alerts():
     day_fn = "EXTRACT(DAY FROM CURRENT_DATE)" if DB_TYPE == "postgres" else "strftime('%d', 'now')"
     query = f"SELECT * FROM fixed_expenses WHERE due_day >= {day_fn} AND due_day <= {day_fn} + 5"
     return run_query(query) or []
+
+
+def get_month_profit_forecast():
+    """Estima o resultado do mes apos os compromissos que ainda faltam vencer."""
+    today = date.today()
+    kpis = get_advanced_kpis("month") or [{}]
+    current = kpis[0]
+    current_net_profit = float(current.get("net_profit") or 0)
+    monthly_payables = get_monthly_payables(today.year, today.month)
+    pending_profit_commitments = [
+        item for item in monthly_payables
+        if item.get("payment_status") == "Pendente" and bool(item.get("affects_profit", 1))
+    ]
+    pending_commitments_total = sum(float(item.get("amount") or 0) for item in pending_profit_commitments)
+    projected_net_profit = current_net_profit - pending_commitments_total
+    return {
+        "current_net_profit": current_net_profit,
+        "pending_commitments_total": pending_commitments_total,
+        "projected_net_profit": projected_net_profit,
+        "pending_commitments": pending_profit_commitments,
+        "status": "positive" if projected_net_profit >= 0 else "negative",
+        "period": f"{today.month:02d}/{today.year}",
+    }
 
 def get_inventory_report():
     query = """

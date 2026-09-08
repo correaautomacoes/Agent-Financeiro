@@ -35,7 +35,7 @@ from db_helpers import (
     get_salespeople, get_salesperson_commissions, pay_salesperson_commission,
     add_salesperson_bonus, get_monthly_payables, pay_monthly_payable,
     create_company_asset, get_company_assets, get_company_assets_summary,
-    get_chat_insight_context
+    get_chat_insight_context, get_bank_account, upsert_bank_account
 )
 from backup_utils import export_backup, import_backup
 import os
@@ -819,6 +819,17 @@ with tab2:
     salesperson_commission_balance = sum(float(item.get('outstanding_amount') or 0) for item in salesperson_commissions_open)
     consignment_payables_open = get_consignment_payables(open_only=True)
     consignment_payable_balance = sum(float(item.get('outstanding_amount') or 0) for item in consignment_payables_open)
+    open_loans_dashboard = get_partner_loans(status="open")
+    open_debt_balance = sum(float(item.get('outstanding_amount') or 0) for item in open_loans_dashboard)
+    c6_debt = next(
+        (float(item.get('outstanding_amount') or 0) for item in open_loans_dashboard
+         if 'c6' in str(item.get('lender_name') or '').lower()),
+        0.0
+    )
+    c6_account = get_bank_account("C6 Bank") or get_bank_account("C6 Bank - Cheque Especial")
+    actual_bank_balance = float(c6_account.get('current_balance') or 0) if c6_account else 0.0
+    c6_limit = float(c6_account.get('credit_limit') or 0) if c6_account else 0.0
+    c6_available_limit = max(c6_limit + actual_bank_balance, 0.0) if actual_bank_balance < 0 else c6_limit
     monthly_payables = get_monthly_payables(date.today().year, date.today().month)
     monthly_payables_pending = sum(
         float(item.get('amount') or 0)
@@ -849,7 +860,7 @@ with tab2:
         bottom_1.metric("🏗️ Invest. em Infra", f"R$ {float(k.get('infra_investment', 0)):.2f}", delta_color="inverse")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
         saldo_real = float(k.get('total_cash', 0)) + float(receivables.get('pending_total', 0) or 0)
-        bottom_3.metric("💰 Saldo em Caixa", f"R$ {float(k.get('total_cash', 0)):.2f}")
+        bottom_3.metric("💰 Saldo bancário real", f"R$ {actual_bank_balance:.2f}")
         bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
     else:
         top_1, top_2, top_3, top_4, top_5 = st.columns(5)
@@ -863,7 +874,7 @@ with tab2:
         bottom_1.metric("🏗️ Invest. em Infra", "R$ 0.00")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
         saldo_real = float(receivables.get('pending_total', 0) or 0)
-        bottom_3.metric("💰 Saldo em Caixa", "R$ 0.00")
+        bottom_3.metric("💰 Saldo bancário real", f"R$ {actual_bank_balance:.2f}")
         bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
 
     extra_1, extra_2, extra_3, extra_4, extra_5 = st.columns(5)
@@ -872,6 +883,11 @@ with tab2:
     extra_3.metric("🧱 Patrimônio Operacional", f"R$ {total_invested_capital + float(kpi_data[0].get('total_cash', 0)) + float(receivable_summary.get('open_amount', 0)):.2f}" if kpi_data else f"R$ {total_invested_capital + float(receivable_summary.get('open_amount', 0)):.2f}")
     extra_4.metric("👩‍💼 A repassar às vendedoras", f"R$ {salesperson_commission_balance:.2f}")
     extra_5.metric("📦 A repassar aos consignantes", f"R$ {consignment_payable_balance:.2f}")
+
+    debt_col1, debt_col2, debt_col3 = st.columns(3)
+    debt_col1.metric("🏦 C6 usado", f"R$ {c6_debt:.2f}")
+    debt_col2.metric("💳 Dívidas abertas", f"R$ {open_debt_balance:.2f}")
+    debt_col3.metric("💳 Limite C6 disponível", f"R$ {c6_available_limit:.2f}")
 
     asset_col1, asset_col2 = st.columns(2)
     asset_col1.metric("🏢 Patrimônio cadastrado", f"R$ {float(asset_summary['total_value']):.2f}")
@@ -896,7 +912,7 @@ with tab2:
             st.info("Nenhum item patrimonial cadastrado.")
 
     st.caption("Capital Investido = infraestrutura acumulada + estoque atual a custo. Aportes dos Sócios ficam separados porque são a origem do capital, não a aplicação dele.")
-    st.caption("Saldo em Caixa não inclui vendas a prazo ainda não recebidas. O card 'A Prazo a Receber' mostra exatamente o que ainda falta entrar.")
+    st.caption("Saldo bancário real vem do último saldo informado do C6. O fluxo contábil acumulado continua disponível nos relatórios, mas não representa dinheiro disponível.")
 
     with st.expander(f"🗓️ Contas a pagar em {date.today().strftime('%m/%Y')} | Pendente: R$ {monthly_payables_pending:.2f}", expanded=True):
         if monthly_payables:

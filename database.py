@@ -324,6 +324,7 @@ def init_db():
         due_day INTEGER,
         start_date DATE,
         end_date DATE,
+        affects_profit BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -354,6 +355,15 @@ def init_db():
         asset_code VARCHAR(100),
         note TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS bank_accounts (
+        id {serial_type},
+        company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        credit_limit DECIMAL(12,2) DEFAULT 0,
+        current_balance DECIMAL(12,2) DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS transactions (
@@ -428,6 +438,16 @@ def init_db():
                 run_query("ALTER TABLE partner_loans ADD COLUMN lender_name VARCHAR(255)")
     except Exception as e:
         print(f"Aviso ao preparar credores de emprestimos: {e}")
+
+    try:
+        if DB_TYPE == "postgres":
+            run_query("ALTER TABLE fixed_expenses ADD COLUMN IF NOT EXISTS affects_profit BOOLEAN DEFAULT TRUE")
+        else:
+            cols = run_query("PRAGMA table_info(fixed_expenses)") or []
+            if not any(c.get("name") == "affects_profit" for c in cols):
+                run_query("ALTER TABLE fixed_expenses ADD COLUMN affects_profit BOOLEAN DEFAULT 1")
+    except Exception as e:
+        print(f"Aviso ao preparar tratamento contábil de compromissos: {e}")
 
     try:
         if DB_TYPE == "postgres":
