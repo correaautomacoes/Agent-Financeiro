@@ -11,8 +11,15 @@ from pathlib import Path
 dotenv_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=dotenv_path, override=True)
 
+import importlib
+import database
+importlib.reload(database)
 from database import run_query, save_transactions_batch, init_db
+
 from ai_agent import process_chat_command, generate_ai_reply, process_statement, set_api_key_permanent
+
+import db_helpers
+importlib.reload(db_helpers)
 from db_helpers import (
     create_company, get_companies,
     create_partner, get_partners, update_partner_share,
@@ -35,7 +42,8 @@ from db_helpers import (
     get_salespeople, get_salesperson_commissions, pay_salesperson_commission,
     add_salesperson_bonus, get_monthly_payables, pay_monthly_payable,
     create_company_asset, get_company_assets, get_company_assets_summary,
-    get_chat_insight_context, get_bank_account, upsert_bank_account
+    get_chat_insight_context, get_bank_account, upsert_bank_account,
+    get_all_bank_accounts, delete_bank_account
 )
 from backup_utils import export_backup, import_backup
 import os
@@ -847,6 +855,7 @@ with tab2:
     total_invested_capital = total_inv_cost + total_infra_assets
 
     # KPIs Principais
+    total_cash_val = float(kpi_data[0].get('total_cash', 0)) if kpi_data else 0.0
     if kpi_data:
         k = kpi_data[0]
         top_1, top_2, top_3, top_4, top_5 = st.columns(5)
@@ -859,8 +868,7 @@ with tab2:
         bottom_1, bottom_2, bottom_3, bottom_4 = st.columns(4)
         bottom_1.metric("🏗️ Invest. em Infra", f"R$ {float(k.get('infra_investment', 0)):.2f}", delta_color="inverse")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
-        saldo_real = float(k.get('total_cash', 0)) + float(receivables.get('pending_total', 0) or 0)
-        bottom_3.metric("💰 Saldo bancário real", f"R$ {actual_bank_balance:.2f}")
+        bottom_3.metric("💰 Saldo em Caixa Real", f"R$ {total_cash_val:.2f}")
         bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
     else:
         top_1, top_2, top_3, top_4, top_5 = st.columns(5)
@@ -873,21 +881,20 @@ with tab2:
         bottom_1, bottom_2, bottom_3, bottom_4 = st.columns(4)
         bottom_1.metric("🏗️ Invest. em Infra", "R$ 0.00")
         bottom_2.metric("📦 Estoque (Venda)", f"R$ {total_inv_sale:.2f}")
-        saldo_real = float(receivables.get('pending_total', 0) or 0)
-        bottom_3.metric("💰 Saldo bancário real", f"R$ {actual_bank_balance:.2f}")
+        bottom_3.metric("💰 Saldo em Caixa Real", "R$ 0.00")
         bottom_4.metric("🧾 A Prazo a Receber", f"R$ {float(receivable_summary.get('open_amount', 0)):.2f}")
 
     extra_1, extra_2, extra_3, extra_4, extra_5 = st.columns(5)
     extra_1.metric("🤝 Aportes dos Sócios", f"R$ {total_partner_capital:.2f}")
     extra_2.metric("🏛️ Capital Investido", f"R$ {total_invested_capital:.2f}")
-    extra_3.metric("🧱 Patrimônio Operacional", f"R$ {total_invested_capital + float(kpi_data[0].get('total_cash', 0)) + float(receivable_summary.get('open_amount', 0)):.2f}" if kpi_data else f"R$ {total_invested_capital + float(receivable_summary.get('open_amount', 0)):.2f}")
+    extra_3.metric("🧱 Patrimônio Operacional", f"R$ {total_invested_capital + total_cash_val + float(receivable_summary.get('open_amount', 0)):.2f}")
     extra_4.metric("👩‍💼 A repassar às vendedoras", f"R$ {salesperson_commission_balance:.2f}")
     extra_5.metric("📦 A repassar aos consignantes", f"R$ {consignment_payable_balance:.2f}")
 
     debt_col1, debt_col2, debt_col3 = st.columns(3)
-    debt_col1.metric("🏦 C6 usado", f"R$ {c6_debt:.2f}")
-    debt_col2.metric("💳 Dívidas abertas", f"R$ {open_debt_balance:.2f}")
-    debt_col3.metric("💳 Limite C6 disponível", f"R$ {c6_available_limit:.2f}")
+    debt_col1.metric("🏦 Saldo C6 Informado", f"R$ {actual_bank_balance:.2f}")
+    debt_col2.metric("💳 Dívidas em Aberto", f"R$ {open_debt_balance:.2f}")
+    debt_col3.metric("💳 Limite C6 Disponível", f"R$ {c6_available_limit:.2f}")
 
     asset_col1, asset_col2 = st.columns(2)
     asset_col1.metric("🏢 Patrimônio cadastrado", f"R$ {float(asset_summary['total_value']):.2f}")
@@ -912,7 +919,7 @@ with tab2:
             st.info("Nenhum item patrimonial cadastrado.")
 
     st.caption("Capital Investido = infraestrutura acumulada + estoque atual a custo. Aportes dos Sócios ficam separados porque são a origem do capital, não a aplicação dele.")
-    st.caption("Saldo bancário real vem do último saldo informado do C6. O fluxo contábil acumulado continua disponível nos relatórios, mas não representa dinheiro disponível.")
+    st.caption("Saldo em Caixa Real é apurado a partir de todas as entradas à vista, saídas pagas, amortizações e retiradas do sistema. Limites e saldos de extratos bancários ficam visíveis separadamente para não distorcer o fluxo de caixa disponível.")
 
     with st.expander(f"🗓️ Contas a pagar em {date.today().strftime('%m/%Y')} | Pendente: R$ {monthly_payables_pending:.2f}", expanded=True):
         if monthly_payables:
@@ -1174,6 +1181,7 @@ with tab2:
                 'Saldo Total com Aportes': 'R$ {:.2f}',
                 'Total Retirado': 'R$ {:.2f}',
             }))
+            st.caption("Nota: Saldo de Lucro = Lucro Líquido gerado proporcional menos o valor total já retirado. Diferente do Saldo em Caixa da empresa, que também inclui capital de giro de empréstimos e aportes.")
         else:
             st.info("Cadastre sócios na aba 'Gerenciar'.")
 
@@ -1869,7 +1877,7 @@ with tab4:
         loan_interest = col_li1.number_input("Juros (% ao mês, opcional)", min_value=0.0, step=0.1, key="loan_interest")
         loan_note = col_li2.text_input("Observação do Empréstimo", key="loan_note", placeholder="Ex: Capital de giro")
 
-        st.markdown("**Parcelamento / juros**")
+        st.markdown("**Parcelamento / Juros e Acordos**")
         col_lp1, col_lp2, col_lp3 = st.columns(3)
         is_installment_loan = col_lp1.checkbox("Pagar em parcelas", key="loan_is_installment")
         loan_installments = col_lp2.number_input(
@@ -1884,35 +1892,81 @@ with tab4:
         first_installment_due = col_lp3.date_input(
             "1º vencimento",
             value=due_date if has_due else date.today(),
-            disabled=not is_installment_loan,
             key="loan_first_installment_due"
         )
 
-        calc_method = "Sem parcelas"
+        col_lc1, col_lc2 = st.columns([2, 1])
+        calc_options = [
+            "Juros fixo em valor (R$)",
+            "Valor total contratado a pagar (R$)",
+            "Informar valor de cada parcela",
+            "Sem juros adicionais",
+            "Total com juros simples (% a.m.)",
+            "Parcela fixa com juros ao mês (PRICE)",
+        ]
+        calc_method = col_lc1.selectbox("Forma de cálculo do empréstimo", calc_options, key="loan_calc_method")
+
+        fixed_interest_input = 0.0
         installment_amount = float(loan_amount)
         total_repayable = float(loan_amount)
-        if is_installment_loan:
-            col_lc1, col_lc2 = st.columns([2, 1])
-            calc_method = col_lc1.selectbox(
-                "Como calcular as parcelas",
-                ["Parcela fixa com juros ao mês (PRICE)", "Total com juros simples", "Informar valor da parcela"],
-                key="loan_calc_method"
-            )
-            if calc_method == "Informar valor da parcela":
-                installment_amount = float(col_lc2.number_input("Valor de cada parcela (R$)", min_value=0.01, step=0.01, key="loan_manual_installment_amount"))
-                total_repayable = round(installment_amount * int(loan_installments), 2)
-            elif calc_method == "Total com juros simples":
-                monthly_rate = float(loan_interest or 0) / 100
-                total_repayable = round(float(loan_amount) * (1 + monthly_rate * int(loan_installments)), 2)
-                installment_amount = round(total_repayable / int(loan_installments), 2)
-            else:
-                monthly_rate = float(loan_interest or 0) / 100
-                if monthly_rate > 0:
-                    installment_amount = round(float(loan_amount) * monthly_rate / (1 - (1 + monthly_rate) ** (-int(loan_installments))), 2)
-                else:
-                    installment_amount = round(float(loan_amount) / int(loan_installments), 2)
-                total_repayable = round(installment_amount * int(loan_installments), 2)
 
+        if calc_method == "Juros fixo em valor (R$)":
+            fixed_interest_input = float(col_lc2.number_input(
+                "Valor do juros fixo (R$)",
+                min_value=0.0,
+                value=0.0,
+                step=10.0,
+                key="loan_fixed_interest_amount",
+                help="Ex: Se pegou 2.500 e combinou pagar 1.250 de juros, digite 1250."
+            ))
+            total_repayable = round(float(loan_amount) + fixed_interest_input, 2)
+            installment_amount = round(total_repayable / int(loan_installments), 2) if is_installment_loan else total_repayable
+        elif calc_method == "Valor total contratado a pagar (R$)":
+            total_repayable = float(col_lc2.number_input(
+                "Total acordado a devolver (R$)",
+                min_value=float(loan_amount),
+                value=float(loan_amount),
+                step=50.0,
+                key="loan_total_repayable_input",
+                help="Ex: Pegou 2.500 e vai pagar 3.750 no total, digite 3750."
+            ))
+            fixed_interest_input = max(total_repayable - float(loan_amount), 0.0)
+            installment_amount = round(total_repayable / int(loan_installments), 2) if is_installment_loan else total_repayable
+        elif calc_method == "Informar valor de cada parcela":
+            installment_amount = float(col_lc2.number_input(
+                "Valor de cada parcela (R$)",
+                min_value=0.01,
+                value=round(float(loan_amount) / int(loan_installments), 2) if is_installment_loan else float(loan_amount),
+                step=0.01,
+                key="loan_manual_installment_amount"
+            ))
+            total_repayable = round(installment_amount * int(loan_installments), 2)
+            fixed_interest_input = max(total_repayable - float(loan_amount), 0.0)
+        elif calc_method == "Total com juros simples (% a.m.)":
+            monthly_rate = float(loan_interest or 0) / 100
+            total_repayable = round(float(loan_amount) * (1 + monthly_rate * int(loan_installments)), 2)
+            fixed_interest_input = max(total_repayable - float(loan_amount), 0.0)
+            installment_amount = round(total_repayable / int(loan_installments), 2)
+        elif calc_method == "Parcela fixa com juros ao mês (PRICE)":
+            monthly_rate = float(loan_interest or 0) / 100
+            if monthly_rate > 0:
+                installment_amount = round(float(loan_amount) * monthly_rate / (1 - (1 + monthly_rate) ** (-int(loan_installments))), 2)
+            else:
+                installment_amount = round(float(loan_amount) / int(loan_installments), 2)
+            total_repayable = round(installment_amount * int(loan_installments), 2)
+            fixed_interest_input = max(total_repayable - float(loan_amount), 0.0)
+        else:
+            total_repayable = float(loan_amount)
+            fixed_interest_input = 0.0
+            installment_amount = round(total_repayable / int(loan_installments), 2) if is_installment_loan else total_repayable
+
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("💰 Principal recebido", f"R$ {float(loan_amount):,.2f}")
+        p2.metric("🏷️ Juros acordado", f"R$ {fixed_interest_input:,.2f}")
+        p3.metric("💳 Total a devolver", f"R$ {total_repayable:,.2f}")
+        p4.metric("🗓️ Parcelamento", f"{int(loan_installments)}x de R$ {installment_amount:,.2f}" if is_installment_loan else f"À vista: R$ {total_repayable:,.2f}")
+
+        if is_installment_loan and int(loan_installments) > 1:
             preview_rows = [
                 {
                     "Parcela": f"{idx}/{int(loan_installments)}",
@@ -1921,10 +1975,6 @@ with tab4:
                 }
                 for idx in range(1, int(loan_installments) + 1)
             ]
-            p1, p2, p3 = st.columns(3)
-            p1.metric("Principal recebido", f"R$ {float(loan_amount):,.2f}")
-            p2.metric("Total a pagar", f"R$ {total_repayable:,.2f}")
-            p3.metric("Parcela", f"R$ {installment_amount:,.2f}")
             st.dataframe(pd.DataFrame(preview_rows).style.format({"Valor": "R$ {:.2f}"}), use_container_width=True, hide_index=True)
 
         if st.button("Registrar Empréstimo", key="btn_create_loan"):
@@ -1946,13 +1996,15 @@ with tab4:
                     loan_date=str(loan_date),
                     due_date=str(due_date) if has_due else None,
                     interest_rate=loan_interest,
-                    note=f"{loan_note} | {calc_method}".strip(" |"),
+                    note=f"{loan_note} | {calc_method} | Juros fixo: R$ {fixed_interest_input:.2f} | Total: R$ {total_repayable:.2f}".strip(" |"),
                     installments=int(loan_installments) if is_installment_loan else 1,
                     installment_amount=installment_amount if is_installment_loan else None,
-                    first_due_date=str(first_installment_due) if is_installment_loan else None
+                    first_due_date=str(first_installment_due) if is_installment_loan else None,
+                    fixed_interest_amount=fixed_interest_input,
+                    total_repayable=total_repayable
                 )
             if loan_id:
-                st.success(f"Empréstimo registrado (id={loan_id}).")
+                st.success(f"Empréstimo registrado (id={loan_id}). Principal recebido: R$ {loan_amount:.2f}, Total a pagar: R$ {total_repayable:.2f}.")
                 st.rerun()
             else:
                 st.error("Erro ao registrar empréstimo.")
@@ -2043,6 +2095,70 @@ with tab4:
             st.info("Não há registros de empréstimos ainda.")
     else:
         st.info("Cadastre um sócio para registrar empréstimos.")
+
+    st.divider()
+    st.subheader("🏦 Contas Bancárias e Conciliação")
+    st.caption("Cadastre suas contas, defina o saldo inicial e mantenha o saldo do extrato atualizado para conciliação.")
+    bank_company_options = {c['name']: c['id'] for c in companies} if companies else {}
+    b_col1, b_col2 = st.columns(2)
+    bank_company = b_col1.selectbox("Empresa da conta", options=["-"] + list(bank_company_options.keys()), key="bank_account_company")
+    bank_name = b_col2.text_input("Nome da Conta / Banco", placeholder="Ex: C6 Bank, Caixa Físico, Nubank", key="bank_account_name")
+
+    b_col3, b_col4, b_col5 = st.columns(3)
+    bank_initial_bal = b_col3.number_input("Saldo Inicial (R$)", value=0.0, step=0.01, key="bank_initial_balance", help="Saldo que a conta possuía antes do início dos lançamentos no sistema.")
+    bank_credit_limit = b_col4.number_input("Limite / Cheque Especial (R$)", value=0.0, min_value=0.0, step=0.01, key="bank_credit_limit")
+    bank_curr_bal = b_col5.number_input("Saldo Atual no Extrato (R$)", value=0.0, step=0.01, key="bank_current_balance", help="Último saldo verificado no aplicativo do banco.")
+
+    if st.button("💾 Salvar Conta Bancária", key="save_bank_account"):
+        if not companies:
+            st.warning("Cadastre uma empresa primeiro na seção 'Empresas'.")
+        elif bank_company == "-" or not bank_name.strip():
+            st.warning("Selecione a empresa e informe o nome da conta.")
+        else:
+            acc_id = upsert_bank_account(
+                bank_company_options[bank_company],
+                bank_name.strip(),
+                float(bank_credit_limit),
+                float(bank_curr_bal),
+                float(bank_initial_bal)
+            )
+            if acc_id:
+                st.success(f"Conta '{bank_name.strip()}' salva com sucesso!")
+                st.rerun()
+            else:
+                st.error("Não foi possível salvar a conta bancária.")
+
+    all_banks = get_all_bank_accounts()
+    if all_banks:
+        st.markdown("**Contas Cadastradas**")
+        bank_df = pd.DataFrame(all_banks)[['id', 'name', 'company_name', 'initial_balance', 'credit_limit', 'current_balance', 'updated_at']].rename(columns={
+            'id': 'ID',
+            'name': 'Conta / Banco',
+            'company_name': 'Empresa',
+            'initial_balance': 'Saldo Inicial',
+            'credit_limit': 'Limite / Cheque Esp.',
+            'current_balance': 'Saldo Extrato Informado',
+            'updated_at': 'Última Atualização'
+        })
+        st.dataframe(
+            bank_df.style.format({
+                'Saldo Inicial': 'R$ {:.2f}',
+                'Limite / Cheque Esp.': 'R$ {:.2f}',
+                'Saldo Extrato Informado': 'R$ {:.2f}'
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        b_del_col1, b_del_col2 = st.columns([3, 1])
+        bank_del_options = {f"#{b['id']} | {b['name']} (Extrato: R$ {float(b['current_balance']):.2f})": b['id'] for b in all_banks}
+        selected_b_del = b_del_col1.selectbox("Remover conta:", options=list(bank_del_options.keys()), key="bank_del_select")
+        if b_del_col2.button("🗑️ Excluir Conta", key="delete_bank_btn"):
+            if delete_bank_account(bank_del_options[selected_b_del]):
+                st.success("Conta removida com sucesso!")
+                st.rerun()
+            else:
+                st.error("Não foi possível remover a conta.")
 
     st.divider()
     st.subheader("📅 Despesas Fixas / Programadas")

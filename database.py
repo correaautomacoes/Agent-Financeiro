@@ -286,6 +286,7 @@ def init_db():
         principal_amount DECIMAL(12,2) NOT NULL,
         outstanding_amount DECIMAL(12,2) NOT NULL,
         interest_rate DECIMAL(6,3) DEFAULT 0,
+        fixed_interest DECIMAL(12,2) DEFAULT 0,
         loan_date DATE DEFAULT CURRENT_DATE,
         due_date DATE,
         note TEXT,
@@ -363,6 +364,7 @@ def init_db():
         name VARCHAR(255) NOT NULL,
         credit_limit DECIMAL(12,2) DEFAULT 0,
         current_balance DECIMAL(12,2) DEFAULT 0,
+        initial_balance DECIMAL(12,2) DEFAULT 0,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -441,6 +443,16 @@ def init_db():
 
     try:
         if DB_TYPE == "postgres":
+            run_query("ALTER TABLE partner_loans ADD COLUMN IF NOT EXISTS fixed_interest DECIMAL(12,2) DEFAULT 0")
+        else:
+            cols = run_query("PRAGMA table_info(partner_loans)") or []
+            if not any(c.get("name") == "fixed_interest" for c in cols):
+                run_query("ALTER TABLE partner_loans ADD COLUMN fixed_interest DECIMAL(12,2) DEFAULT 0")
+    except Exception as e:
+        print(f"Aviso ao preparar juros fixos de emprestimos: {e}")
+
+    try:
+        if DB_TYPE == "postgres":
             run_query("ALTER TABLE fixed_expenses ADD COLUMN IF NOT EXISTS affects_profit BOOLEAN DEFAULT TRUE")
         else:
             cols = run_query("PRAGMA table_info(fixed_expenses)") or []
@@ -468,6 +480,16 @@ def init_db():
                 run_query("ALTER TABLE stock_movements ADD COLUMN consignment_supplier_id INTEGER")
     except Exception as e:
         print(f"Aviso ao preparar vínculo de consignação: {e}")
+
+    try:
+        if DB_TYPE == "postgres":
+            run_query("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS initial_balance DECIMAL(12,2) DEFAULT 0")
+        else:
+            cols = run_query("PRAGMA table_info(bank_accounts)") or []
+            if not any(c.get("name") == "initial_balance" for c in cols):
+                run_query("ALTER TABLE bank_accounts ADD COLUMN initial_balance DECIMAL(12,2) DEFAULT 0")
+    except Exception as e:
+        print(f"Aviso ao preparar saldo inicial de contas bancarias: {e}")
 
     try:
         run_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_product_barcodes_barcode ON product_barcodes(barcode)")

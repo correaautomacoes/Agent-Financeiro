@@ -1423,13 +1423,15 @@ def create_partner_loan(
     installments: int = 1,
     installment_amount: Optional[float] = None,
     first_due_date: Optional[str] = None,
-    lender_name: Optional[str] = None
+    lender_name: Optional[str] = None,
+    fixed_interest_amount: float = 0.0,
+    total_repayable: Optional[float] = None
 ) -> Optional[int]:
     """
-    Registra empréstimo entre sócio e empresa.
+    Registra empréstimo entre sócio/credor e empresa.
     direction:
-      - partner_to_company: sócio empresta para empresa (entrada de caixa)
-      - company_to_partner: empresa empresta para sócio (saída de caixa)
+      - partner_to_company: sócio/credor empresta para empresa (entrada de caixa)
+      - company_to_partner: empresa empresta para sócio/credor (saída de caixa)
     """
     if direction not in ("partner_to_company", "company_to_partner"):
         return None
@@ -1440,10 +1442,27 @@ def create_partner_loan(
     if amount <= 0:
         return None
     installments = max(int(installments or 1), 1)
-    installment_amount = float(installment_amount or 0)
-    if installments > 1 and installment_amount <= 0:
-        return None
-    total_repayable = round(installment_amount * installments, 2) if installments > 1 else amount
+    fixed_interest = max(float(fixed_interest_amount or 0), 0.0)
+
+    if total_repayable and float(total_repayable) > 0:
+        calc_total = round(float(total_repayable), 2)
+        if fixed_interest <= 0:
+            fixed_interest = max(calc_total - amount, 0.0)
+    elif fixed_interest > 0:
+        calc_total = round(amount + fixed_interest, 2)
+    elif installments > 1 and float(installment_amount or 0) > 0:
+        calc_total = round(float(installment_amount) * installments, 2)
+        fixed_interest = max(calc_total - amount, 0.0)
+    else:
+        calc_total = amount
+
+    if installments > 1:
+        if not installment_amount or float(installment_amount) <= 0:
+            installment_amount = round(calc_total / installments, 2)
+    else:
+        installment_amount = calc_total
+
+    total_repayable = calc_total
 
     conn = get_db_connection()
     if not conn:
@@ -1456,13 +1475,13 @@ def create_partner_loan(
         due_sql = ph
 
         q = (
-            f"INSERT INTO partner_loans (partner_id, lender_name, direction, principal_amount, outstanding_amount, interest_rate, loan_date, due_date, note, status) "
-            f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {dt_sql}, {due_sql}, {ph}, 'open')"
+            f"INSERT INTO partner_loans (partner_id, lender_name, direction, principal_amount, outstanding_amount, interest_rate, fixed_interest, loan_date, due_date, note, status) "
+            f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {dt_sql}, {due_sql}, {ph}, 'open')"
         )
         params = (
-            (partner_id, lender_name, direction, amount, total_repayable, float(interest_rate or 0), loan_date, due_date, note)
+            (partner_id, lender_name, direction, amount, total_repayable, float(interest_rate or 0), fixed_interest, loan_date, due_date, note)
             if loan_date
-            else (partner_id, lender_name, direction, amount, total_repayable, float(interest_rate or 0), due_date, note)
+            else (partner_id, lender_name, direction, amount, total_repayable, float(interest_rate or 0), fixed_interest, due_date, note)
         )
 
         if DB_TYPE == "postgres":
@@ -1491,8 +1510,10 @@ def create_partner_loan(
             f"INSERT INTO transactions (type, amount, category, description, date, partner_id) "
             f"VALUES ({ph}, {ph}, 'Empréstimo Sócios', {ph}, {dt_tx}, {ph})"
         )
+        interest_desc = f" | Juros fixo: R$ {fixed_interest:.2f}" if fixed_interest > 0 else ""
+        total_desc = f" | Total a pagar: R$ {total_repayable:.2f}" if total_repayable != amount else ""
         parcel_note = f" Parcelado em {installments}x de R$ {installment_amount:.2f}." if installments > 1 else ""
-        tx_desc = f"[LOAN:{loan_id}] Empréstimo {direction_label}.{parcel_note} {note or ''}".strip()
+        tx_desc = f"[LOAN:{loan_id}] Empréstimo {direction_label}.{interest_desc}{total_desc}{parcel_note} {note or ''}".strip()
         tx_params = (t_type, amount, tx_desc, loan_date, partner_id) if loan_date else (t_type, amount, tx_desc, partner_id)
         cur.execute(tx_q, tx_params)
 
@@ -1904,9 +1925,14 @@ def get_partner_reports(company_id: Optional[int] = None) -> List[Dict[str, Any]
         ) or []
         receivable_open_total += float(legacy_receivables[0].get("total", 0) or 0) if legacy_receivables else 0.0
     
+    commission_res = run_query(
+        "SELECT COALESCE(SUM(commission_amount), 0) AS total FROM salesperson_commissions"
+    ) if _table_exists("salesperson_commissions") else []
+    commission_expenses_total = float(commission_res[0]['total']) if commission_res else 0.0
+
     for r in res:
-        # Lucro real = Receita - Despesas - CMV
-        lucro_real = float(r['total_revenue']) - float(r['total_expenses']) - cmv_total
+        # Lucro real = Receita - Despesas - CMV - Comissões de vendedoras
+        lucro_real = float(r['total_revenue']) - float(r['total_expenses']) - cmv_total - commission_expenses_total
         share_ratio = float(r['share_pct']) / 100.0
         # Cota do sócio no lucro operacional
         r['share_of_profit'] = lucro_real * share_ratio
@@ -2033,22 +2059,40 @@ def get_bank_account(name: str):
     return rows[0] if rows else None
 
 
-def upsert_bank_account(company_id: int, name: str, credit_limit: float, current_balance: float) -> Optional[int]:
+def get_all_bank_accounts(company_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    if not _table_exists("bank_accounts"):
+        return []
+    query = """
+        SELECT b.id, b.company_id, b.name, b.credit_limit, b.current_balance,
+               COALESCE(b.initial_balance, 0) AS initial_balance, b.updated_at,
+               COALESCE(c.name, 'Empresa Padrão') AS company_name
+        FROM bank_accounts b
+        LEFT JOIN companies c ON c.id = b.company_id
+    """
+    params = []
+    if company_id:
+        query += " WHERE b.company_id = %s"
+        params.append(company_id)
+    query += " ORDER BY b.name"
+    return run_query(query, tuple(params) if params else None) or []
+
+
+def upsert_bank_account(company_id: int, name: str, credit_limit: float, current_balance: float, initial_balance: float = 0.0) -> Optional[int]:
     if not _table_exists("bank_accounts"):
         return None
     existing = get_bank_account(name)
     if existing:
         run_query(
-            "UPDATE bank_accounts SET credit_limit = %s, current_balance = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
-            (float(credit_limit or 0), float(current_balance or 0), existing["id"]),
+            "UPDATE bank_accounts SET company_id = %s, credit_limit = %s, current_balance = %s, initial_balance = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+            (company_id, float(credit_limit or 0), float(current_balance or 0), float(initial_balance or 0), existing["id"]),
         )
         return existing["id"]
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         ph = "?" if DB_TYPE == "sqlite" else "%s"
-        q = f"INSERT INTO bank_accounts (company_id, name, credit_limit, current_balance) VALUES ({ph}, {ph}, {ph}, {ph})"
-        params = (company_id, name, float(credit_limit or 0), float(current_balance or 0))
+        q = f"INSERT INTO bank_accounts (company_id, name, credit_limit, current_balance, initial_balance) VALUES ({ph}, {ph}, {ph}, {ph}, {ph})"
+        params = (company_id, name, float(credit_limit or 0), float(current_balance or 0), float(initial_balance or 0))
         if DB_TYPE == "postgres":
             cur.execute(q + " RETURNING id", params)
             account_id = cur.fetchone()[0]
@@ -2067,6 +2111,17 @@ def upsert_bank_account(company_id: int, name: str, credit_limit: float, current
         except Exception:
             pass
         return None
+
+
+def delete_bank_account(account_id: int) -> bool:
+    if not _table_exists("bank_accounts"):
+        return False
+    try:
+        run_query("DELETE FROM bank_accounts WHERE id = %s", (account_id,))
+        return True
+    except Exception as e:
+        print(f"Erro delete_bank_account: {e}")
+        return False
 
 def get_upcoming_alerts():
     day_fn = "EXTRACT(DAY FROM CURRENT_DATE)" if DB_TYPE == "postgres" else "strftime('%d', 'now')"
